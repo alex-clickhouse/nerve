@@ -1,5 +1,5 @@
 """Tests for config-dir resolution, the pointer file, unknown-key
-validation, and config write-back helpers."""
+validation, blank path settings, and config write-back helpers."""
 
 from __future__ import annotations
 
@@ -10,8 +10,14 @@ from pathlib import Path
 import pytest
 import yaml
 
+from nerve import paths
 from nerve.config import (
+    CronConfig,
+    NerveConfig,
+    ProxyConfig,
+    SSLConfig,
     TelegramConfig,
+    WorkflowRunsConfig,
     append_telegram_allowed_user,
     load_config,
     read_config_pointer,
@@ -226,3 +232,90 @@ class TestAppendTelegramAllowedUser:
         append_telegram_allowed_user(tmp_path, 42)
         mode = stat.S_IMODE(os.stat(tmp_path / "config.local.yaml").st_mode)
         assert mode == 0o600
+
+
+class TestBlankPathSettingsMeanUnset:
+    """A path setting left blank must fall back to its default, not to ".".
+
+    ``Path("")`` is ``Path(".")`` and truthy, so a key written as ``runs_dir:``
+    or ``cert: ""`` would otherwise sail straight past the ``or <default>``
+    fallback and resolve to the working directory the daemon was started in —
+    silently, since that directory usually exists and is writable. One test per
+    key, because each one goes wrong in its own way: writing state where nobody
+    will look for it, importing whatever ``.py`` files happen to be lying
+    around, or serving TLS with no certificate.
+    """
+
+    def test_gateway_ssl_blank_cert_and_key_disable_tls(self):
+        ssl = SSLConfig.from_dict({"cert": "", "key": ""})
+        assert (ssl.cert, ssl.key) == (None, None)
+        assert ssl.enabled is False
+
+    def test_gateway_ssl_blank_cert_alone_disables_tls(self):
+        """``enabled`` means "both files are set" — half-configured is off."""
+        ssl = SSLConfig.from_dict({"cert": "", "key": "/etc/ssl/nerve.key"})
+        assert ssl.enabled is False
+
+    def test_workflows_runs_dir(self):
+        """Run journals belong under the state dir, not next to the daemon."""
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": ""})
+        assert cfg.runs_dir == paths.nerve_path("workflow-runs")
+
+    def test_proxy_binary_path(self):
+        cfg = ProxyConfig.from_dict({"binary_path": ""})
+        assert cfg.binary_path == paths.nerve_path("bin", "cli-proxy-api")
+
+    def test_proxy_auth_dir(self):
+        """Proxy OAuth material must not be dropped into the cwd."""
+        cfg = ProxyConfig.from_dict({"auth_dir": ""})
+        assert cfg.auth_dir == paths.nerve_path("cli-proxy-auth")
+
+    def test_proxy_log_file(self):
+        cfg = ProxyConfig.from_dict({"log_file": ""})
+        assert cfg.log_file == paths.nerve_path("proxy.log")
+
+    def test_cron_gate_plugins_dir(self):
+        """This one executes what it finds — every ``*.py`` in the directory."""
+        cfg = CronConfig.from_dict({"gate_plugins_dir": ""})
+        assert cfg.gate_plugins_dir == paths.cron_dir() / "gates"
+
+    def test_cron_jobs_file(self):
+        cfg = CronConfig.from_dict({"jobs_file": ""})
+        assert cfg.jobs_file == paths.cron_dir() / "jobs.yaml"
+
+    def test_cron_system_file(self):
+        cfg = CronConfig.from_dict({"system_file": ""})
+        assert cfg.system_file == paths.cron_dir() / "system.yaml"
+
+    def test_workspace(self):
+        cfg = NerveConfig.from_dict({"workspace": ""})
+        assert cfg.workspace == paths.default_workspace()
+
+    @pytest.mark.parametrize("blank", ["   ", "\t", "\n", " \t "])
+    def test_whitespace_only_counts_as_blank(self, blank):
+        """A stray space after the colon is the likeliest way to write this."""
+        cfg = CronConfig.from_dict({"gate_plugins_dir": blank})
+        assert cfg.gate_plugins_dir == paths.cron_dir() / "gates"
+
+    def test_an_env_var_that_expands_to_nothing_is_blank_too(self, monkeypatch):
+        """``NERVE_TEST_RUNS_DIR=`` in a unit file or compose env block."""
+        monkeypatch.setenv("NERVE_TEST_RUNS_DIR", "")
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "$NERVE_TEST_RUNS_DIR"})
+        assert cfg.runs_dir == paths.nerve_path("workflow-runs")
+
+    def test_a_configured_path_is_still_honored(self):
+        cfg = CronConfig.from_dict({"gate_plugins_dir": "/opt/nerve/gates"})
+        assert cfg.gate_plugins_dir == Path("/opt/nerve/gates")
+
+    def test_tilde_still_expands(self):
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "~/runs"})
+        assert cfg.runs_dir == Path.home() / "runs"
+
+    def test_surrounding_whitespace_is_trimmed_not_baked_in(self):
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "  ~/runs  "})
+        assert cfg.runs_dir == Path.home() / "runs"
+
+    def test_a_set_env_var_still_expands(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("NERVE_TEST_RUNS_DIR", str(tmp_path / "runs"))
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "$NERVE_TEST_RUNS_DIR"})
+        assert cfg.runs_dir == tmp_path / "runs"

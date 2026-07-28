@@ -18,6 +18,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from nerve import paths
 from nerve.sources.base import Source
 from nerve.sources.models import FetchResult, SourceRecord
 
@@ -51,7 +52,7 @@ class TelegramSource(Source):
             return False
 
         session_path = os.path.expanduser(
-            self._config.get("session_path", "~/.nerve/telegram_sync")
+            self._config.get("session_path") or str(paths.nerve_path("telegram_sync"))
         )
 
         # Check if session file exists — Telethon requires interactive auth

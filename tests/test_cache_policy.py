@@ -174,7 +174,7 @@ def _make_env_backend(is_bedrock: bool = False) -> ClaudeBackend:
         proxy=SimpleNamespace(enabled=False, host="", port=0),
         effective_api_key="",
     )
-    return ClaudeBackend(SimpleNamespace(config=config))
+    return ClaudeBackend(SimpleNamespace(config=lambda: config))
 
 
 def test_build_env_5m_has_no_cache_flag():

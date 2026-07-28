@@ -23,8 +23,8 @@ machine-local:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `gateway.host`/`port`, `provider` (incl. the region-scoped Bedrock model IDs), `proxy`, `docker`, `telegram.enabled`, `external_agents` |
-| `settings.yaml` | `timezone`, `agent.*`, `memory.*`, `sessions.*`, `sync.*`, `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
+| `config.yaml` | `workspace`, `deployment`, `gateway.host`/`port`, `provider` (incl. the region-scoped Bedrock model IDs), `proxy`, `docker`, `telegram.enabled`, `external_agents`, `workflows.runs_dir` |
+| `settings.yaml` | `timezone`, `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 A key is written to exactly one of them. Writing a shared value to both would
 make the tracked copy dead weight, since `config.yaml` shadows it.
@@ -210,6 +210,93 @@ jobs:
       # view and the lockdown checks never run. See "Lockdown" below.
 ```
 
+## Hot-Reload
+
+Many config changes apply **without a restart** — but not all of them, and a
+config file changing on disk is not by itself one of them.
+
+### What triggers a reload
+
+A reload is an explicit act. Three things cause one:
+
+- **`POST /api/config/reload`** — re-reads all three layers and reloads every
+  reloadable subsystem at once. This is the one to use after editing a file on
+  the box.
+- **A workspace sync that merged something** — applies exactly the same set, so
+  a reviewed config PR takes effect on the instance without anyone logging in.
+- **A write inside the cron directories** — the cron file watcher reloads cron
+  *jobs and gate plugins* on its own when `cron.auto_reload` is on. Nothing else:
+  not other config files, and not cron *sources*, which are configured under
+  `sync.*` rather than in the cron directory.
+
+**Editing `config.yaml`, `config.local.yaml` or `settings.yaml` does not apply
+itself.** That is deliberate, not an omission. A hand edit is exactly the change
+nobody reviewed: on a locked instance the contract is that the running config
+came from the tracked repo, and sync will already *refuse* to merge while
+`config/` has local modifications — so quietly hot-applying the same edit from a
+watcher would contradict it. Editors also write in pieces, and a config reload
+re-points the whole process, which is not something to do halfway through a save.
+Ask for it when you mean it; the endpoint is authenticated and logs what it did.
+
+### What a reload applies
+
+| Change | Reloaded? |
+|--------|-----------|
+| Cron jobs (`config/cron/*.yaml`) | ✅ also automatic, via the file watcher |
+| Custom cron gate plugins — new, edited *and* deleted `.py` files | ✅ the registry is rebuilt from the directory; also automatic |
+| Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ the watcher follows them |
+| Cron sources — `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled. **`sync.codex` is not one of these** — see the restart table |
+| MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
+| Skills (`skills/`) | ✅ re-scanned |
+| `lockdown` | ✅ the write guards and the layer stack both follow |
+| Web gateway auth (`auth.*`) | ✅ read per request |
+| `notifications.*` | ✅ read per notification |
+| `workspace_sync.*` | ✅ from the next sync cycle |
+| `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
+| `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep — provided at least one target existed at start-up (see the restart table) |
+| `sessions.sticky_period_minutes` | ✅ |
+| `provider.*` and the API keys it selects — `aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` above |
+| **`agent.*` and `codex.*`** — backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` *and* `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
+
+### What still needs a restart
+
+| Change | Why |
+|--------|-----|
+| `gateway.host`, `.port`, `.ssl.*` | the socket is already bound |
+| `timezone` | the cron scheduler and every trigger built from it carry the old zone |
+| `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
+| `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at start-up. Following it in one of them and not the others would be worse than not following it at all |
+| `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with |
+| `codex.home_dir` | half-hot, which is why it is here: new sessions are handed the new `CODEX_HOME`, but the directory is only created when the backend is built, so nothing makes the new one. Change it and restart rather than leaving sessions pointed somewhere that may not exist |
+| `sync.codex.*` — `enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*` | Codex thread sync is a **different service** from the cron sources above, built once at start-up with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
+| `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
+| `telegram.*`, including `allowed_users` | the bot is running with the allow-list it was started with. Note that notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart |
+| `mcp_endpoint.*`, including the token check on `/mcp/v1` | fixed when the app was created — this is *not* the same code as the web gateway's auth above, which is hot |
+| `proxy.*` | the proxy process is started during start-up, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
+| Turning `ollama.enabled` **on** while the proxy is not already running | Ollama routes through the proxy as its translation layer, and that process only starts at start-up. With the proxy already up, this is read per use and follows a reload |
+| `cron.auto_reload` | the watcher task is created at start-up, and there is nothing left to notice the flag either way |
+| Turning `workspace_sync.enabled` or `retention.enabled` **on** | their loops are only created at start-up, so there is nothing running to see the flag change. Turning either **off** is hot |
+| `external_agents.enabled` — **both** directions — and adding the **first** target | the sweeper is only created when the flag is on *and* at least one target is configured; with none it is never created, so the first target added later reloads to `ok` and does nothing (`POST /api/external-agents/sync` answers 503). Once it exists, adding, removing and toggling targets is hot |
+| A session that is **already running** | the agent process was spawned with the options in force at the time; the new ones apply to the next session |
+
+Everything in the first table is reloaded together, and the response says what
+happened to each piece: `POST /api/config/reload` returns `ok`, a per-subsystem
+`detail`, and an `errors` map. A reload is deliberately best-effort — a typo in
+`settings.yaml` must not stop a valid cron edit from being applied — so `ok:
+false` with `detail` showing four subsystems reloaded and one failed is a normal
+answer, not a contradiction. Check `errors`; do not read the 200 as success.
+
+`POST /api/config/sync` runs the same reload but scores it differently, because
+it is answering a different question. Its `ok` is about the *merge*: true once
+the merged config is loaded and in effect, false only when the daemon could not
+load it (in which case the merge applied nothing at all). A subsystem that failed
+*after* the config loaded leaves `ok: true` — the merged settings really are
+live — and shows up as `applied: false` with the reason in `reload_errors`. So
+the same skills failure gives `ok: false` on `/api/config/reload` and
+`ok: true, applied: false` on `/api/config/sync`. **On the sync endpoint, read
+`applied`, not `ok`**, unless what you want to know is specifically whether the
+merge took.
+
 ## Git-Backed Workspace Sync
 
 The workspace can be a git repository whose remote (on GitHub) is a shared
@@ -240,8 +327,11 @@ fast-forward merge**: it fetches the remote, validates the *fetched* bundle in a
 throwaway git worktree, and only fast-forwards the live working tree if
 validation passes. So an invalid bundle **never lands on disk** — nothing for the
 file watcher or the next restart to pick up (`POST /api/config/sync` returns 400
-and leaves the workspace untouched). On a successful, changed pull it reloads
-cron and MCP config so the merged changes take effect immediately. CI
+and leaves the workspace untouched). On a successful, changed pull it runs the
+same reload as `POST /api/config/reload` — see [Hot-Reload](#hot-reload) for what
+that covers and what it doesn't — and says in its response which subsystems took
+the merged change (`applied`, `reload`, `reload_errors`). A merge whose config
+the daemon then refuses to load has applied *nothing* and reports `ok: false`. CI
 (`nerve config validate`) on the PR is still the first line of defense. The remote
 and credentials come from git itself (configure `git remote` / auth in the
 workspace as usual).
@@ -273,13 +363,15 @@ an unknown key, a skipped validation — are reported but do not block the merge
 since validation deliberately does not load the bundle's gate plugins and cannot
 tell a plugin's gate type from a typo.
 
-`workspace_sync` changes need a **daemon restart**. The sync loop reads the
-current config object on every cycle rather than a copy taken at startup, so it
-adds no staleness of its own — but nothing refreshes that object while the
-process runs, so an edit to `branch`, `interval_minutes`, `validate` or
-`strict_env` does not reach a running daemon. Turning `enabled` on will need a
-restart in any case: the sync task is only created at startup, and there is
-nothing to re-read the flag if it was never started.
+`workspace_sync` changes apply **from the next cycle, once a reload has run**.
+The sync loop reads the current config object every cycle rather than a copy
+taken at startup, so an edit to `branch`, `interval_minutes`, `validate` or
+`strict_env` reaches it as soon as something replaces that object — a sync that
+merged a change, or `POST /api/config/reload` after editing the file yourself
+(see [Hot-Reload](#hot-reload): a file changing on disk does not reload itself).
+Turning `enabled` **on** still needs a restart: the sync task is only created at
+startup, and there is nothing to re-read the flag if it was never started.
+Turning it off is picked up like any other value.
 
 ## Lockdown (remote-only, read-only)
 
@@ -447,17 +539,17 @@ booleans do, so a `${TG_ON:-nope}` typo cannot turn the bot on fleet-wide. Both
 `load_config` and `nerve config validate` say so when a bundle sets
 `telegram.bot_token` without `telegram.enabled`.
 
-**Flipping the flag needs the config to be reloaded, and only a sync does that.**
-Applying a `lockdown` change through
-[workspace sync](#git-backed-workspace-sync) re-reads the config and re-points the
-process-wide object. What picks the change up immediately is everything that reads
-that object per use: the write guards, gateway authentication (REST and
-WebSocket), the sync loop itself, and `cron_service.config` / `engine.config`,
-which are re-pointed explicitly. What does **not**: cron jobs and gates already
-built, which follow on the next cron reload, and anything captured in a closure or
-a dataclass at start-up, which follows on a restart. Nothing but a sync refreshes
-any of it — editing `settings.yaml` on the box by hand has no effect on a running
-daemon, which is what lockdown exists to stop anyway. If a sync merges a config
+**Flipping the flag needs the config to be reloaded.** A sync does that, and so
+does `POST /api/config/reload` — both run the same reload, so both re-read the
+config and re-point the process-wide object. What picks the change up immediately
+is everything that reads that object per use: the write guards, gateway
+authentication (REST and WebSocket), the sync loop itself, and
+`cron_service.config` / `engine.config`, which are re-pointed explicitly. What
+does **not**: cron jobs and gates already built, which follow on the next cron
+reload, and anything captured in a closure or a dataclass at start-up, which
+follows on a restart. What never refreshes anything by itself is editing
+`settings.yaml` on the box by hand — the file changing on disk is not a reload,
+and under lockdown that edit is ignored anyway, which is the point. If a sync merges a config
 the daemon then cannot load, the sync reports `ok: false` with `apply_error`
 rather than claiming the change took: a box that was told to lock and did not is
 exactly the case you must not learn about later. Pair lockdown with sync: sync

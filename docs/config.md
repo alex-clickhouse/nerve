@@ -13,6 +13,54 @@ A blank value (`runs_dir:` with nothing after it, or `""`) means *unset*, so the
 documented default applies. That includes `gateway.ssl.cert`/`key`: blank means
 TLS is off, not TLS with an empty certificate path.
 
+## Environment Variable References
+
+Any string value in `config.yaml` / `config.local.yaml` may reference an
+environment variable, so secrets can be supplied from the environment (or a
+secret store) instead of being written into a file:
+
+```yaml
+anthropic_api_key: ${ANTHROPIC_API_KEY}         # required — load fails if unset
+gateway:
+  host: ${BIND_HOST:-127.0.0.1}                 # optional — default when unset/empty
+```
+
+- `${VAR}` — **required**. If `VAR` is not set, config loading fails with a
+  clear error listing every unresolved variable.
+- `${VAR:-default}` — **optional**. Uses `default` when `VAR` is unset *or*
+  empty (shell `:-` semantics).
+- `$$` — an escaped literal `$` (so `$${X}` yields the literal text `${X}`).
+
+Only the **braced** `${...}` form is interpolated. A bare `$` is never touched,
+so bcrypt `password_hash` values (`$2b$...`), jwt secrets, and connection
+strings are safe as-is. Interpolation runs after the local overlay is merged,
+so `config.local.yaml` may reference env vars too. This is the recommended way
+to keep secrets out of any file that will be committed to a shared/remote
+workspace repo.
+
+Notes:
+- `${VAR}` treats only an **unset** variable as an error; `VAR=""` (set but
+  empty) resolves to an empty string. Use `${VAR:-default}` if you want a
+  fallback when the value is empty as well.
+- Resolved values are always **strings**. `port: ${PORT}` arrives as `"8080"`,
+  the same as if you had quoted it in YAML. Fields declared `int`, `float` or
+  `bool` — including `int | None` and `list[int]` forms — are converted back
+  to their declared type when the config object is built, so `port: ${PORT}`
+  and `enabled: ${FEATURE}` behave the same as literal YAML values.
+- For booleans the accepted spellings are `true/false`, `1/0`, `yes/no`,
+  `on/off`, `y/n`, `t/f` (case-insensitive). **`enabled: ${FLAG}` with
+  `FLAG=false` is off** — the string is parsed, not tested for truthiness.
+  An empty value (`FLAG=`) and a bare `enabled:` are both **off**, so a
+  blanked-out env var reliably disables a feature rather than falling back to
+  whatever the tracked config said.
+- An *unrecognized* value is logged (with the owning `Class.field`) and the
+  field keeps its documented default, so a typo can't flip a flag to the
+  opposite of both what it says and what the config declares. Integers are
+  parsed with `int()`, so `"1.5"` and `"1e3"` are rejected rather than
+  truncated.
+- Defaults are **not** re-scanned: `${A:-${B}}` yields the literal `${B}` when
+  `A` is unset; nest by using a single reference instead.
+
 ## Config Directory Resolution
 
 `nerve` commands locate the config directory via a waterfall, so they work

@@ -6,6 +6,7 @@ Supports ~ expansion in paths and environment variable references.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from nerve import paths
+from nerve.coerce import coerced as _coerced
+from nerve.coerce import lenient_int as _lenient_int
 
 import yaml
 
@@ -74,12 +77,85 @@ def _expand_path(p: str | None) -> Path | None:
     return Path(expanded)
 
 
+class ConfigError(ValueError):
+    """Raised when configuration cannot be loaded (e.g. an unresolved
+    required ``${ENV_VAR}`` reference)."""
+
+
+# Matches an escaped ``$$`` (literal dollar) or a ``${...}`` reference.
+# We deliberately only interpolate the *braced* form so that values which
+# legitimately contain a bare ``$`` — bcrypt ``password_hash`` (``$2b$..``),
+# jwt secrets, connection strings — are never touched.
+_ENV_REF_RE = re.compile(r"\$\$|\$\{([^}]*)\}")
+
+
+def _interpolate_str(value: str, missing: list[str]) -> str:
+    """Resolve ``${VAR}`` / ``${VAR:-default}`` references in a single string.
+
+    * ``${VAR}``            — required; if unset, the name is appended to
+      ``missing`` and the reference is left intact (the caller raises).
+    * ``${VAR:-default}``   — use ``default`` when VAR is unset *or* empty
+      (shell ``:-`` semantics).
+    * ``$$``                — an escaped literal ``$`` (so ``$${X}`` yields the
+      literal text ``${X}``).
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        if match.group(0) == "$$":
+            return "$"
+        expr = match.group(1)
+        if ":-" in expr:
+            name, default = expr.split(":-", 1)
+            name = name.strip()
+            resolved = os.environ.get(name)
+            return resolved if resolved else default
+        name = expr.strip()
+        if not name:
+            # `${}` — almost certainly a typo. Leave it intact rather than
+            # emitting a confusing "missing variable: ''" error.
+            return match.group(0)
+        if name in os.environ:
+            return os.environ[name]
+        missing.append(name)
+        return match.group(0)
+
+    return _ENV_REF_RE.sub(_replace, value)
+
+
+def _interpolate_env(obj: Any, missing: list[str]) -> Any:
+    """Recursively resolve ``${ENV_VAR}`` references in all string values of a
+    merged config structure. Non-string leaves are returned unchanged."""
+    if isinstance(obj, dict):
+        return {k: _interpolate_env(v, missing) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_interpolate_env(v, missing) for v in obj]
+    if isinstance(obj, str):
+        return _interpolate_str(obj, missing)
+    return obj
+
+
+def _resolve_env_refs(merged: dict[str, Any]) -> dict[str, Any]:
+    """Interpolate ``${ENV_VAR}`` references across a merged config dict,
+    raising :class:`ConfigError` listing every unresolved required variable."""
+    missing: list[str] = []
+    resolved = _interpolate_env(merged, missing)
+    if missing:
+        names = ", ".join(sorted(set(missing)))
+        raise ConfigError(
+            f"Unresolved required environment variable(s) in config: {names}. "
+            "Set them in the environment, or use ${VAR:-default} to supply a "
+            "fallback."
+        )
+    return resolved
+
+
 @dataclass
 class SSLConfig:
     cert: Path | None = None
     key: Path | None = None
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> SSLConfig:
         return cls(cert=_expand_path(d.get("cert")), key=_expand_path(d.get("key")))
 
@@ -95,6 +171,7 @@ class GatewayConfig:
     ssl: SSLConfig = field(default_factory=SSLConfig)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> GatewayConfig:
         return cls(
             host=d.get("host", "0.0.0.0"),
@@ -124,6 +201,7 @@ class ProviderConfig:
         return self.type == "bedrock"
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ProviderConfig:
         return cls(
             type=d.get("type", "anthropic"),
@@ -157,12 +235,13 @@ class PromptRewriteConfig:
     timeout_seconds: float = 45.0
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> PromptRewriteConfig:
         return cls(
-            enabled=bool(d.get("enabled", True)),
+            enabled=d.get("enabled", True),
             model=d.get("model", ""),
-            max_tokens=int(d.get("max_tokens", 1024)),
-            timeout_seconds=float(d.get("timeout_seconds", 45.0)),
+            max_tokens=d.get("max_tokens", 1024),
+            timeout_seconds=d.get("timeout_seconds", 45.0),
         )
 
 
@@ -232,6 +311,7 @@ class AgentConfig:
         return self.cron_backend or self.backend
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> AgentConfig:
         return cls(
             backend=str(d.get("backend", "claude")).strip().lower(),
@@ -252,10 +332,8 @@ class AgentConfig:
             cache_ttl_excluded_models=list(
                 d.get("cache_ttl_excluded_models", []) or []
             ),
-            cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
-            background_agent_permissions=bool(
-                d.get("background_agent_permissions", True)
-            ),
+            cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
+            background_agent_permissions=d.get("background_agent_permissions", True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 
@@ -286,6 +364,7 @@ class TelegramConfig:
     dm_policy: str = "pairing"
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> TelegramConfig:
         dm_policy = d.get("dm_policy", "pairing")
         if dm_policy not in ("pairing", "open"):
@@ -298,7 +377,13 @@ class TelegramConfig:
         return cls(
             enabled=d.get("enabled", True),
             bot_token=d.get("bot_token", ""),
-            allowed_users=[int(u) for u in d.get("allowed_users", []) or []],
+            # Deliberately uncast. The declared list[int] is converted after
+            # construction, which logs an unconvertible entry and keeps it
+            # verbatim; casting here raises instead, so one bad value in a
+            # section that may not even be enabled would stop the daemon
+            # booting. It also stopped a bare string being read character by
+            # character — "123" became the three user IDs 1, 2 and 3.
+            allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
         )
@@ -319,6 +404,7 @@ class TelegramSyncConfig:
     condense: bool = False
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> TelegramSyncConfig:
         return cls(
             enabled=d.get("enabled", True),
@@ -349,6 +435,7 @@ class GmailSyncConfig:
     condense_prompt: str = ""  # Custom prompt for LLM condensation (overrides default)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> GmailSyncConfig:
         return cls(
             enabled=d.get("enabled", True),
@@ -389,6 +476,7 @@ class GitHubSyncConfig:
     deny_actors: list[str] = field(default_factory=list)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> GitHubSyncConfig:
         return cls(
             enabled=d.get("enabled", True),
@@ -419,6 +507,7 @@ class GitHubEventsSyncConfig:
     model: str = ""
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> GitHubEventsSyncConfig:
         return cls(
             enabled=d.get("enabled", False),
@@ -452,6 +541,7 @@ class GitHubReposSyncConfig:
     model: str = ""
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> GitHubReposSyncConfig:
         return cls(
             enabled=d.get("enabled", False),
@@ -485,14 +575,15 @@ class CodexOriginConfig:
     transport: dict = field(default_factory=dict)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> CodexOriginConfig:
         return cls(
             id=d.get("id", "local"),
             type=d.get("type", "local_rollout"),
-            enabled=bool(d.get("enabled", True)),
+            enabled=d.get("enabled", True),
             path=d.get("path", "~/.codex/sessions"),
             archive_path=d.get("archive_path", "~/.codex/archived_sessions"),
-            poll_interval_seconds=float(d.get("poll_interval_seconds", 2.0)),
+            poll_interval_seconds=d.get("poll_interval_seconds", 2.0),
             transport=d.get("transport", {}),
         )
 
@@ -514,6 +605,7 @@ class CodexWorkspaceFilterConfig:
     explicit_paths: list[str] = field(default_factory=list)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> CodexWorkspaceFilterConfig:
         return cls(
             mode=str(d.get("mode", "nerve_workspace")),
@@ -537,6 +629,7 @@ class CodexSyncConfig:
     store_encrypted_reasoning: bool = True
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> CodexSyncConfig:
         raw_origins = d.get("origins", [])
         origins = [
@@ -545,12 +638,12 @@ class CodexSyncConfig:
             if isinstance(o, dict)
         ]
         return cls(
-            enabled=bool(d.get("enabled", False)),
+            enabled=d.get("enabled", False),
             workspace_filter=CodexWorkspaceFilterConfig.from_dict(
                 d.get("workspace_filter", {}),
             ),
             origins=origins,
-            store_encrypted_reasoning=bool(d.get("store_encrypted_reasoning", True)),
+            store_encrypted_reasoning=d.get("store_encrypted_reasoning", True),
         )
 
 
@@ -566,6 +659,7 @@ class SyncConfig:
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> SyncConfig:
         return cls(
             telegram=TelegramSyncConfig.from_dict(d.get("telegram", {})),
@@ -585,6 +679,7 @@ class MemoryCategoryConfig:
     description: str
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> MemoryCategoryConfig:
         return cls(name=d["name"], description=d.get("description", ""))
 
@@ -601,6 +696,7 @@ class MemoryConfig:
     categories: list[MemoryCategoryConfig] = field(default_factory=list)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> MemoryConfig:
         default_dsn = f"sqlite:///{paths.memu_sqlite()}"
         raw_cats = d.get("categories", [])
@@ -611,8 +707,8 @@ class MemoryConfig:
             fast_model=d.get("fast_model", "claude-haiku-4-5-20251001"),
             embed_model=d.get("embed_model", ""),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
-            semantic_dedup_threshold=float(d.get("semantic_dedup_threshold", 0.85)),
-            knowledge_filter=bool(d.get("knowledge_filter", False)),
+            semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
+            knowledge_filter=d.get("knowledge_filter", False),
             categories=categories,
         )
 
@@ -626,6 +722,7 @@ class CronConfig:
     gate_plugins_dir: Path = field(default_factory=lambda: paths.cron_dir() / "gates")
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> CronConfig:
         return cls(
             jobs_file=_expand_path(d.get("jobs_file")) or paths.cron_dir() / "jobs.yaml",
@@ -655,16 +752,17 @@ class BackupConfig:
     notify_on_success: bool = False  # low-priority digest line
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> BackupConfig:
         return cls(
-            enabled=bool(d.get("enabled", False)),
+            enabled=d.get("enabled", False),
             target_dir=d.get("target_dir", ""),
-            interval_hours=int(d.get("interval_hours", 24)),
-            retention_count=int(d.get("retention_count", 7)),
-            include_workspace=bool(d.get("include_workspace", True)),
+            interval_hours=d.get("interval_hours", 24),
+            retention_count=d.get("retention_count", 7),
+            include_workspace=d.get("include_workspace", True),
             workspace_excludes=list(d.get("workspace_excludes", []) or []),
-            notify_on_failure=bool(d.get("notify_on_failure", True)),
-            notify_on_success=bool(d.get("notify_on_success", False)),
+            notify_on_failure=d.get("notify_on_failure", True),
+            notify_on_success=d.get("notify_on_success", False),
         )
 
 
@@ -698,15 +796,20 @@ class WorkflowRunsConfig:
     allow_unbudgeted: bool = False
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> WorkflowRunsConfig:
+        # Raw values through: an eager cast here happens before interpolated
+        # strings are converted, and `bool("false")` is already True. That
+        # matters most for allow_unbudgeted, whose whole job is to refuse
+        # runs that would spend without a cap.
         return cls(
-            enabled=bool(d.get("enabled", True)),
+            enabled=d.get("enabled", True),
             runs_dir=_expand_path(d.get("runs_dir")) or paths.nerve_path("workflow-runs"),
-            poll_interval_seconds=int(d.get("poll_interval_seconds", 60)),
-            warn_fraction=float(d.get("warn_fraction", 0.8)),
-            kill_grace_seconds=int(d.get("kill_grace_seconds", 30)),
-            max_concurrent_runs=int(d.get("max_concurrent_runs", 2)),
-            allow_unbudgeted=bool(d.get("allow_unbudgeted", False)),
+            poll_interval_seconds=d.get("poll_interval_seconds", 60),
+            warn_fraction=d.get("warn_fraction", 0.8),
+            kill_grace_seconds=d.get("kill_grace_seconds", 30),
+            max_concurrent_runs=d.get("max_concurrent_runs", 2),
+            allow_unbudgeted=d.get("allow_unbudgeted", False),
         )
 
 
@@ -725,8 +828,9 @@ class HouseOfAgentsConfig:
     enabled: bool = False
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> HouseOfAgentsConfig:
-        return cls(enabled=bool(d.get("enabled", False)))
+        return cls(enabled=d.get("enabled", False))
 
 
 @dataclass
@@ -740,6 +844,7 @@ class SessionsConfig:
     client_idle_timeout_minutes: int = 60  # Auto-disconnect clients idle longer than this (0 = disabled)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> SessionsConfig:
         return cls(
             archive_after_days=d.get("archive_after_days", 30),
@@ -775,12 +880,13 @@ class RetentionConfig:
     interval_hours: int = 24
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> RetentionConfig:
         return cls(
-            enabled=bool(d.get("enabled", False)),
-            retention_days=max(1, int(d.get("retention_days", 90))),
-            retention_full_days=max(1, int(d.get("retention_full_days", 30))),
-            interval_hours=max(1, int(d.get("interval_hours", 24))),
+            enabled=d.get("enabled", False),
+            retention_days=max(1, _lenient_int(d.get("retention_days"), 90)),
+            retention_full_days=max(1, _lenient_int(d.get("retention_full_days"), 30)),
+            interval_hours=max(1, _lenient_int(d.get("interval_hours"), 24)),
         )
 
 
@@ -790,6 +896,7 @@ class AuthConfig:
     jwt_secret: str = ""
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> AuthConfig:
         return cls(
             password_hash=d.get("password_hash", ""),
@@ -810,6 +917,7 @@ class NotificationsConfig:
     })
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
             channels=d.get("channels", ["web", "telegram"]),
@@ -828,6 +936,7 @@ class ChannelsConfig:
     """Global channel settings."""
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ChannelsConfig:
         return cls()
 
@@ -839,6 +948,7 @@ class DockerConfig:
     extra_mounts: list[str] = field(default_factory=list)  # e.g. ["~/code:/code"]
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> DockerConfig:
         return cls(
             extra_mounts=d.get("extra_mounts", []),
@@ -858,6 +968,7 @@ class ProxyConfig:
     log_file: Path = field(default_factory=lambda: paths.nerve_path("proxy.log"))
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ProxyConfig:
         return cls(
             enabled=d.get("enabled", False),
@@ -904,11 +1015,12 @@ class OllamaConfig:
         return f"http://{self.host}:{self.port}/v1"
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> OllamaConfig:
         return cls(
-            enabled=bool(d.get("enabled", False)),
+            enabled=d.get("enabled", False),
             host=d.get("host", "127.0.0.1"),
-            port=int(d.get("port", 11434)),
+            port=d.get("port", 11434),
         )
 
 
@@ -931,11 +1043,12 @@ class McpEndpointConfig:
     include_hoa: bool = False   # Expose the deprecated hoa_* stub tools to external clients
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> McpEndpointConfig:
         return cls(
-            enabled=bool(d.get("enabled", False)),
+            enabled=d.get("enabled", False),
             path=str(d.get("path", "/mcp/v1")),
-            include_hoa=bool(d.get("include_hoa", False)),
+            include_hoa=d.get("include_hoa", False),
         )
 
 
@@ -958,10 +1071,11 @@ class ExternalAgentTargetConfig:
     token: str = ""                            # deprecated; never persisted
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ExternalAgentTargetConfig:
         return cls(
             name=str(d.get("name", "")),
-            enabled=bool(d.get("enabled", True)),
+            enabled=d.get("enabled", True),
             token="",
         )
 
@@ -992,6 +1106,7 @@ class ExternalAgentsConfig:
     targets: list[ExternalAgentTargetConfig] = field(default_factory=list)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ExternalAgentsConfig:
         raw_targets = d.get("targets", [])
         targets: list[ExternalAgentTargetConfig] = []
@@ -1000,21 +1115,11 @@ class ExternalAgentsConfig:
                 if isinstance(raw, dict) and raw.get("name"):
                     targets.append(ExternalAgentTargetConfig.from_dict(raw))
         return cls(
-            enabled=bool(d.get("enabled", True)),
-            sync_interval_minutes=int(d.get("sync_interval_minutes", 15)),
+            enabled=d.get("enabled", True),
+            sync_interval_minutes=d.get("sync_interval_minutes", 15),
             conflict_policy=str(d.get("conflict_policy", "backup")),
             targets=targets,
         )
-
-
-def _lenient_int(value: Any, default: int) -> int:
-    """Best-effort int coercion — malformed inactive config must not
-    brick startup (validate() reports problems when the section is live)."""
-    try:
-        return int(value) if value is not None else default
-    except (TypeError, ValueError):
-        logger.warning("Ignoring non-integer config value %r", value)
-        return default
 
 
 _CODEX_APPROVAL_POLICIES = ("never", "on-request", "untrusted")
@@ -1051,16 +1156,17 @@ class UltracodeConfig:
     max_agents: int = 8
 
     @classmethod
+    @_coerced
     def from_dict(cls, raw: dict | None) -> "UltracodeConfig":
         d = raw or {}
         return cls(
-            enabled=bool(d.get("enabled", False)),
-            auto_install=bool(d.get("auto_install", True)),
+            enabled=d.get("enabled", False),
+            auto_install=d.get("auto_install", True),
             repository=str(d.get("repository") or cls.repository),
             revision=str(d.get("revision") or cls.revision),
             version=str(d.get("version") or cls.version),
-            dashboard=bool(d.get("dashboard", False)),
-            ui=bool(d.get("ui", False)),
+            dashboard=d.get("dashboard", False),
+            ui=d.get("ui", False),
             default_transport=str(d.get("default_transport") or "exec"),
             max_concurrency=_lenient_int(d.get("max_concurrency"), 2),
             default_token_budget=_lenient_int(
@@ -1123,6 +1229,7 @@ class CodexConfig:
     ultracode: UltracodeConfig = field(default_factory=UltracodeConfig)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> "CodexConfig":
         pricing = {k: dict(v) for k, v in _DEFAULT_CODEX_PRICING.items()}
         raw_pricing = d.get("pricing") or {}
@@ -1161,7 +1268,7 @@ class CodexConfig:
             sandbox=str(d.get("sandbox", "danger-full-access")),
             approval_policy=str(d.get("approval_policy", "never")),
             effort_map=effort_map,
-            web_search=bool(d.get("web_search", True)),
+            web_search=d.get("web_search", True),
             tool_timeout_sec=_lenient_int(d.get("tool_timeout_sec"), 3600),
             turn_idle_timeout_seconds=_lenient_int(
                 d.get("turn_idle_timeout_seconds"), 0,
@@ -1214,6 +1321,7 @@ class McpServerConfig:
     headers: dict[str, str] = field(default_factory=dict)
 
     @classmethod
+    @_coerced
     def from_dict(cls, name: str, d: dict) -> McpServerConfig:
         return cls(
             name=name,
@@ -1375,6 +1483,7 @@ class LangfuseConfig:
     )
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> "LangfuseConfig":
         return cls(
             public_key=d.get("public_key", ""),
@@ -1412,6 +1521,7 @@ class XmemoryConfig:
         return bool(self.api_key and self.instance_id)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> "XmemoryConfig":
         return cls(
             api_key=d.get("api_key", ""),
@@ -1419,7 +1529,7 @@ class XmemoryConfig:
             api_url=d.get("api_url", "https://api.xmemory.ai"),
             extraction_logic=d.get("extraction_logic", "deep"),
             read_mode=d.get("read_mode", "single-answer"),
-            timeout=float(d.get("timeout", 60.0)),
+            timeout=d.get("timeout", 60.0),
         )
 
 
@@ -1598,6 +1708,7 @@ class NerveConfig:
                 )
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> NerveConfig:
         config = cls._build_from_dict(d)
         config._validate_backend_config()
@@ -1667,6 +1778,7 @@ def load_mcp_servers(config_dir: Path | None = None) -> list[McpServerConfig]:
             local = yaml.safe_load(f) or {}
 
     merged = _deep_merge(base, local)
+    merged = _resolve_env_refs(merged)
     return _parse_mcp_servers(merged)
 
 
@@ -1769,6 +1881,10 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
             local = yaml.safe_load(f) or {}
 
     merged = _deep_merge(base, local)
+
+    # Resolve ${ENV_VAR} references before typing the config so secrets can be
+    # supplied from the environment rather than committed to tracked files.
+    merged = _resolve_env_refs(merged)
 
     # Surface typos and stale keys instead of silently ignoring them.
     for warning in validate_config_keys(merged):

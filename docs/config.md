@@ -202,6 +202,63 @@ jobs:
       - run: nerve config validate --workspace . --portable-only --strict-keys
 ```
 
+## Migrating an Existing Install
+
+Installs from before the workspace-config layout are migrated automatically
+(idempotently) on `nerve upgrade` and daemon start; you can also run it by hand:
+
+```bash
+nerve migrate --dry-run   # show what would change
+nerve migrate             # apply
+```
+
+Migration is **non-destructive**:
+
+- `config.yaml` → `workspace/config/settings.yaml` (git-tracked). Secret values
+  are moved into machine-local `config.local.yaml` and replaced with `${ENV_VAR}`
+  placeholders. Three things are treated as secret: values under secret-looking
+  key names (`*api_key*`, `*api_hash*`, `api_id`, `*token*`, `*secret*`,
+  `password*`, `jwt`, `authorization`, `bearer`, `oauth`, `*access_key*`,
+  `*private_key*`, `dsn`, `pw`, `pat`, `session_string`, `webhook_url`), values
+  whose *shape* is a credential whatever the key is called (`sk-…`, `ghp_…`,
+  `xox…`, `user:password@host`, `?token=…`, `Bearer …`), and *every* value inside
+  an `env` or `headers` block — including inside lists, where MCP `args` and
+  `headers` entries live. The machine-local `workspace` path is also kept in
+  `config.local.yaml`.
+- `~/.nerve/cron/*` → `workspace/config/cron/*` (the whole directory, including
+  any `prompts/` referenced by `prompt_file`).
+- Originals are renamed to `*.migrated` breadcrumbs, never deleted; an existing
+  breadcrumb is never overwritten. The effective configuration is unchanged —
+  values are only relocated. `config.local.yaml` and the breadcrumb both carry
+  plaintext secrets, so both are written `0600`; `settings.yaml` gets the mode
+  an ordinary write would have given it, so a restrictive `umask` is honored.
+
+Two deliberate limits on the shape rules. They only fire when the *whole value*
+is the credential, so a category description that mentions `postgres://user:pass@host`
+stays put instead of becoming a `${VAR}` nobody can resolve. And a public
+identifier is not a secret: `client_id` is left alone, `client_secret` is not.
+
+If one item in a list is a secret, the **whole list** moves to
+`config.local.yaml` — a merge replaces a list rather than combining it
+element-wise, so there is no way to override one entry. Migration says so when
+it happens; the copy left in `settings.yaml` no longer has any effect.
+
+Secret detection is best-effort — **always review `workspace/config/settings.yaml`
+before committing it to a shared repo** — then run `nerve config validate` to
+confirm the bundle is well-formed. Migration also reports any value it left in
+the tracked file that still looks like a credential (a long opaque string under
+a key it has no opinion about); those are yours to judge.
+
+Migration only runs on a pre-refactor `config.yaml` — one holding shareable
+settings, not just this box's. A `config.yaml` written by `nerve init` under the
+current layout contains only machine-local keys (workspace, bind address,
+provider handles), so it is left exactly where it is even if the workspace has
+no `settings.yaml` at all. Migration is likewise a no-op once `settings.yaml`
+carries real keys: the `nerve init` scaffold is all comments and counts as
+empty, but anything more does not. If a `config.yaml` with shareable keys is
+still sitting next to a populated `settings.yaml`, migration says so — it is
+overriding the tracked file — and you move the keys across by hand.
+
 ## Config Directory Resolution
 
 `nerve` commands locate the config directory via a waterfall, so they work

@@ -292,6 +292,9 @@ class CronService:
         self._jobs: list[CronJob] = []
         self._source_runners: list[SourceRunner] = []
         self._job_locks: dict[str, asyncio.Lock] = {}
+        # Serialize reload() so the file watcher, the sync loop, and the HTTP
+        # route can't interleave scheduler mutations.
+        self._reload_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
@@ -440,8 +443,17 @@ class CronService:
         built before the scheduler is touched, so a reload the daemon cannot
         carry out raises with the running schedule exactly as it was.
 
+        Serialized via a lock so concurrent callers (file watcher, sync loop,
+        HTTP route) can't interleave scheduler mutations. The two properties are
+        separate: the lock keeps two reloads from overlapping, and the planning
+        pass keeps a single failing one from applying half of itself.
+
         Returns a summary dict: ``{"added", "removed", "updated", "enabled"}``.
         """
+        async with self._reload_lock:
+            return await self._reload_locked()
+
+    async def _reload_locked(self) -> dict:
         from nerve.cron.gate_plugins import load_gate_plugins
 
         # Re-read drop-in gate plugins before jobs are rebuilt (their gates are

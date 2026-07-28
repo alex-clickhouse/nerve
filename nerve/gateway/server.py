@@ -223,6 +223,8 @@ async def lifespan(app: FastAPI):
     cron_task = None
     cron_watch_task = None
     cron_watch_stop = None
+    ws_sync_task = None
+    ws_sync_stop = None
     try:
         from nerve.cron.service import CronService
         cron = CronService(config, _engine, db)
@@ -301,6 +303,14 @@ async def lifespan(app: FastAPI):
             logger.info("houseofagents retired: deleted binary %s", hoa_binary)
     except Exception as e:
         logger.warning("houseofagents artifact cleanup failed: %s", e)
+
+    # Periodically pull the workspace from its git remote and apply (opt-in).
+    if config.workspace_sync.enabled:
+        from nerve.sync_service import run_periodic_sync
+        ws_sync_stop = asyncio.Event()
+        ws_sync_task = asyncio.create_task(
+            run_periodic_sync(config, _engine, _cron_service, ws_sync_stop)
+        )
 
     # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
     # it tightens to hourly only when the opt-in interactive idle auto-close
@@ -591,6 +601,14 @@ async def lifespan(app: FastAPI):
     # the telegram polling task before we get a chance to stop it cleanly.
     if telegram_channel:
         await telegram_channel.stop()
+    if ws_sync_task:
+        if ws_sync_stop is not None:
+            ws_sync_stop.set()
+        ws_sync_task.cancel()
+        try:
+            await ws_sync_task
+        except (asyncio.CancelledError, Exception):
+            pass
     if cron_watch_task:
         # Let the watcher finish the cycle it's in — a reload cancelled halfway
         # leaves the scheduler holding a mix of the old and new job sets — and

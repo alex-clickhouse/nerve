@@ -202,6 +202,77 @@ jobs:
       - run: nerve config validate --workspace . --portable-only --strict-keys
 ```
 
+## Git-Backed Workspace Sync
+
+The workspace can be a git repository whose remote (on GitHub) is a shared
+**config repo**. Config changes are proposed as PRs, reviewed, and merged there;
+the instance pulls the merged result and hot-reloads — no restart, no editing on
+the box.
+
+```bash
+nerve config sync                 # git pull --ff-only the workspace, then validate
+nerve config sync --branch main
+nerve config sync --no-validate
+nerve config sync --no-strict-env # tolerate ${VAR}s your shell doesn't have
+```
+
+Enable periodic pulls in the daemon (opt-in):
+
+```yaml
+workspace_sync:
+  enabled: true          # off by default
+  branch: main           # empty = current tracking branch
+  interval_minutes: 5
+  validate: true         # validate the pulled bundle before applying
+  strict_env: true       # unset required ${VAR} in the bundle blocks the merge
+```
+
+When enabled, the daemon syncs on that cadence. Sync is **fetch → validate →
+fast-forward merge**: it fetches the remote, validates the *fetched* bundle in a
+throwaway git worktree, and only fast-forwards the live working tree if
+validation passes. So an invalid bundle **never lands on disk** — nothing for the
+file watcher or the next restart to pick up (`POST /api/config/sync` returns 400
+and leaves the workspace untouched). On a successful, changed pull it reloads
+cron and MCP config so the merged changes take effect immediately. CI
+(`nerve config validate`) on the PR is still the first line of defense. The remote
+and credentials come from git itself (configure `git remote` / auth in the
+workspace as usual).
+
+**Keep the config subtree clean.** Sync refuses to merge while
+`<workspace>/config/` has local changes — an edited or deleted tracked file, a
+staged change, an untracked file. Validation judges a clean checkout of the
+fetched commit, but the merge lands in your working tree, and `--ff-only` only
+refuses when the incoming commit touches the same path. Anything else survives
+the merge without ever having been checked, so the bundle on disk would not be
+the bundle that passed. An untracked `config/cron/gates/*.py` is the case that
+matters most: the daemon imports and runs gate plugins, and validation
+deliberately never loads them, so it would run unreviewed local code on a box
+whose whole point is that it runs only reviewed remote config. Commit, discard or
+push local edits; the failure message names the paths. Files matched by
+`.gitignore` inside `config/` are reported as warnings, not refusals — they are
+config the shared repo can never carry.
+
+Sync validates **more strictly than CI**: an unset required `${VAR}` fails the
+sync. CI has no secrets, so it reports those as info; the daemon does have them,
+and a bundle with an unresolved required variable is one it will refuse to load
+on its next restart — merging it would leave the box in a state that only breaks
+later. If a shared change adds a `${VAR}` this particular box legitimately does
+not set, relax it with `workspace_sync.strict_env: false` rather than letting
+every sync fail. `nerve config sync` runs in your shell, which may not carry the
+daemon's environment (systemd `EnvironmentFile`, docker `--env-file`); pass
+`--no-strict-env` there for a one-off. Warnings — an unrecognized cron gate type,
+an unknown key, a skipped validation — are reported but do not block the merge,
+since validation deliberately does not load the bundle's gate plugins and cannot
+tell a plugin's gate type from a typo.
+
+`workspace_sync` changes need a **daemon restart**. The sync loop reads the
+current config object on every cycle rather than a copy taken at startup, so it
+adds no staleness of its own — but nothing refreshes that object while the
+process runs, so an edit to `branch`, `interval_minutes`, `validate` or
+`strict_env` does not reach a running daemon. Turning `enabled` on will need a
+restart in any case: the sync task is only created at startup, and there is
+nothing to re-read the flag if it was never started.
+
 ## Migrating an Existing Install
 
 Installs from before the workspace-config layout are migrated automatically

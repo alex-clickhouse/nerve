@@ -45,8 +45,15 @@ Rules (all fail-safe — a bad plugin never crashes the daemon):
 * A gate gets only ``GateContext{job_id, db}`` (DB-only). A liveness/registry
   based gate is out of scope for this loader — it would need the context
   widened, a separate change.
-* No hot-reload: adding or changing a plugin requires a daemon restart, the
-  same as every other piece of cron config.
+* Hot-reload: ``load_gate_plugins(dir, replace=True)`` (used by
+  :meth:`nerve.cron.service.CronService.reload`) re-reads the directory from
+  scratch — a *new* file is registered, an *edited* file's new code replaces the
+  old class, and a *deleted* file's gate is unregistered. Reload then rebuilds
+  every job's gates from the refreshed registry and swaps the rebuilt job into
+  the scheduler, so the change reaches the running job and not just the
+  registry. Without ``replace`` the first-registered class wins (used on fresh
+  startup, and by validation so a candidate bundle can't swap the live
+  registry).
 
 **Trust model.** Files in the gate-plugins directory are imported (i.e.
 executed) at daemon startup. This is the same trust model as ``config.yaml``,
@@ -65,12 +72,27 @@ from nerve.cron.gates import GATE_REGISTRY, CronGate
 
 logger = logging.getLogger(__name__)
 
+#: Module-name prefix stamped on every plugin-loaded module (see
+#: :func:`_import_module`). It's how we tell a plugin-registered gate class apart
+#: from a built-in (whose ``__module__`` is ``nerve.cron.gates``) — used by
+#: ``replace=True`` to drop only plugin-owned entries on reload.
+_PLUGIN_MODULE_PREFIX = "nerve_cron_gate_plugin_"
 
-def load_gate_plugins(plugins_dir: Path) -> int:
+
+def load_gate_plugins(plugins_dir: Path, *, replace: bool = False) -> int:
     """Discover and register :class:`CronGate` subclasses from *plugins_dir*.
 
     Returns the number of gate classes newly registered into
     :data:`GATE_REGISTRY`. A missing directory is a no-op (returns ``0``).
+
+    With ``replace=True`` the directory is re-read from scratch: every
+    plugin-owned entry is dropped from the registry first, so an *edited*
+    plugin's new code takes effect, a *deleted* plugin's gate is unregistered,
+    and a *renamed* type is moved — the registry ends up reflecting exactly the
+    files on disk. This is the hot-reload path (:meth:`CronService.reload`).
+    Built-ins are never dropped. The default (``replace=False``) is
+    first-registered-wins and is used on fresh startup and by config validation
+    (so validating a candidate bundle can't mutate the live registry).
 
     Never raises: a broken plugin file is logged and skipped so it can't take
     down daemon startup (mirrors :func:`nerve.cron.gates.build_gates`' existing
@@ -82,8 +104,14 @@ def load_gate_plugins(plugins_dir: Path) -> int:
         logger.warning("Invalid cron gate plugins dir %r: %s", plugins_dir, e)
         return 0
 
+    # Drop previously plugin-loaded gates before rescanning so edits/deletes are
+    # reflected. Do this even if the dir has since disappeared (deleted plugins
+    # must still unregister). Built-ins stay put.
+    removed_types = _unregister_plugin_gates() if replace else set()
+
     if not plugins_dir.is_dir():
         # Missing dir is the normal case — most installs have no custom gates.
+        _warn_vanished(removed_types)
         return 0
 
     registered = 0
@@ -97,7 +125,40 @@ def load_gate_plugins(plugins_dir: Path) -> int:
         logger.info(
             "Loaded %d custom cron gate(s) from %s", registered, plugins_dir,
         )
+    if replace:
+        _warn_vanished(removed_types)
     return registered
+
+
+def _unregister_plugin_gates() -> set[str]:
+    """Remove every plugin-loaded gate from :data:`GATE_REGISTRY`; keep built-ins.
+
+    Returns the set of gate types removed, so the caller can warn about any that
+    fail to come back (a plugin that was deleted or no longer imports cleanly).
+    """
+    removed: set[str] = set()
+    for gate_type, cls in list(GATE_REGISTRY.items()):
+        if getattr(cls, "__module__", "").startswith(_PLUGIN_MODULE_PREFIX):
+            del GATE_REGISTRY[gate_type]
+            removed.add(gate_type)
+    return removed
+
+
+def _warn_vanished(removed_types: set[str]) -> None:
+    """Warn about gate types that were unregistered and did not re-register.
+
+    A gate that disappears on reload means its plugin file was deleted or now
+    fails to import; jobs referencing it will build without it (``build_gates``
+    logs-and-skips an unknown type) and thus run unconditionally. Surface it
+    loudly rather than letting a synced pull silently drop a precondition.
+    """
+    for gate_type in sorted(removed_types - set(GATE_REGISTRY)):
+        logger.warning(
+            "Cron gate %r is no longer registered after reload — its plugin file "
+            "was removed or failed to re-import; jobs using it will run WITHOUT "
+            "that gate",
+            gate_type,
+        )
 
 
 def _load_file(path: Path) -> int:
@@ -146,7 +207,11 @@ def _import_module(path: Path):
     throwaway namespace whose only purpose is to surface the gate classes it
     defines, so it never pollutes the global module table.
     """
-    mod_name = f"nerve_cron_gate_plugin_{path.stem}"
+    # Derived from the shared constant, never spelled out again: the prefix is
+    # the only link between a module loaded here and the registry entries
+    # ``_unregister_plugin_gates`` is allowed to drop, so two copies drifting
+    # apart would silently turn hot-reload into "plugin gates never unregister".
+    mod_name = f"{_PLUGIN_MODULE_PREFIX}{path.stem}"
     try:
         spec = importlib.util.spec_from_file_location(mod_name, path)
         if spec is None or spec.loader is None:

@@ -19,6 +19,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Scheduler ids the daemon owns; a job defined in system.yaml/jobs.yaml may not
+# claim one. `source:` is reserved as a whole namespace rather than as the set of
+# runners that happen to be live: source runners register as `source:<name>`, and
+# which ones exist depends on the sync config, so reserving only the live ones
+# would let a job take `source:telegram` while telegram is switched off and then
+# be silently replaced the moment it is switched back on.
+RESERVED_JOB_IDS = frozenset({"cleanup", "wakeup_sweep"})
+RESERVED_JOB_ID_PREFIX = "source:"
+
+
+def is_reserved_job_id(job_id: str) -> bool:
+    """True if *job_id* belongs to the daemon and can't be used by a cron job."""
+    return job_id in RESERVED_JOB_IDS or job_id.startswith(RESERVED_JOB_ID_PREFIX)
+
+
+def describe_reserved_job_ids() -> str:
+    """Human-readable summary of the reservation, for logs and CLI output."""
+    return (
+        f"{', '.join(sorted(RESERVED_JOB_IDS))}, "
+        f"and anything starting with '{RESERVED_JOB_ID_PREFIX}'"
+    )
+
+
 @dataclass
 class CronJob:
     """A cron job definition."""
@@ -188,8 +211,16 @@ class CronJob:
         return job
 
 
-def load_jobs(jobs_file: Path) -> list[CronJob]:
-    """Load cron jobs from a YAML file."""
+def load_jobs(jobs_file: Path, strict: bool = False) -> list[CronJob]:
+    """Load cron jobs from a YAML file.
+
+    By default this is *tolerant*: a YAML parse failure or an invalid job entry
+    is logged and skipped (so a typo never takes down daemon startup). With
+    ``strict=True`` any such failure raises :class:`nerve.config.ConfigError`
+    instead — used by hot-reload so a malformed file is refused rather than
+    silently unscheduling every job. A missing file is never an error (returns
+    ``[]``) in either mode.
+    """
     if not jobs_file.exists():
         logger.info("No cron jobs file at %s", jobs_file)
         return []
@@ -199,11 +230,20 @@ def load_jobs(jobs_file: Path) -> list[CronJob]:
             data = yaml.safe_load(f) or {}
     except Exception as e:
         logger.error("Failed to load cron jobs from %s: %s", jobs_file, e)
+        if strict:
+            from nerve.config import ConfigError
+            raise ConfigError(f"Failed to parse cron file {jobs_file}: {e}") from e
         return []
 
-    jobs_data = data.get("jobs", [])
-    if isinstance(data, list):
-        jobs_data = data
+    jobs_data = data.get("jobs", []) if isinstance(data, dict) else data
+    if not isinstance(jobs_data, list):
+        if strict:
+            from nerve.config import ConfigError
+            raise ConfigError(
+                f"Cron file {jobs_file} must contain a 'jobs:' list"
+            )
+        logger.error("Cron file %s has no valid 'jobs' list — ignoring", jobs_file)
+        return []
 
     jobs = []
     for item in jobs_data:
@@ -211,6 +251,11 @@ def load_jobs(jobs_file: Path) -> list[CronJob]:
             jobs.append(CronJob.from_dict(item, base_dir=jobs_file.parent))
         except (KeyError, TypeError, ValueError) as e:
             logger.warning("Invalid cron job definition: %s — %s", item, e)
+            if strict:
+                from nerve.config import ConfigError
+                raise ConfigError(
+                    f"Invalid cron job in {jobs_file}: {item!r} — {e}"
+                ) from e
 
     logger.info("Loaded %d cron jobs from %s", len(jobs), jobs_file)
     return jobs

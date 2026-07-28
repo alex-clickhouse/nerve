@@ -308,6 +308,16 @@ class CronService:
         # Load job definitions from both files
         self._jobs = self._load_merged_jobs()
 
+        # Under lockdown the legacy ~/.nerve/cron fallback is disabled, so an
+        # unpopulated workspace cron dir means zero user crons — surface it.
+        if self.config.lockdown and not any(
+            j.metadata.get("_source") == "user" for j in self._jobs
+        ):
+            logger.warning(
+                "Lockdown: no user crons found in %s (legacy ~/.nerve/cron is "
+                "ignored when locked)", self.config.cron.jobs_file.parent,
+            )
+
         # Register cron jobs with persistent timer alignment
         for job in self._jobs:
             if not job.enabled:

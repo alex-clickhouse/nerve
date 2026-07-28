@@ -486,6 +486,17 @@ def build_gates(specs: list[dict]) -> list[CronGate]:
     Invalid specs are logged and skipped rather than raising, so one bad
     gate can't take down the whole cron service at load time. A job whose
     gates all fail to build behaves as if it has no gates (runs normally).
+
+    Note the direction of that: a gate is a *precondition*, so dropping one makes
+    the job run more often, not less — a typo'd ``type`` turns "only when the
+    inbox is busy" into "every time". This is deliberately not tightened for a
+    locked instance, where the reflex would be to drop the job instead. Silently
+    never running a scheduled job is the worse failure of the two: it produces no
+    signal at all, whereas an unexpected run is visible in the session list. The
+    typo is caught earlier and louder instead — ``nerve config validate`` warns
+    per unrecognized type and names this consequence, sync surfaces that warning
+    on the pull that introduced it, and a plugin that stops registering is warned
+    about by name on reload.
     """
     gates: list[CronGate] = []
     for spec in specs or []:

@@ -7,6 +7,7 @@ Ctrl+C at any point leaves the system untouched.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import secrets
@@ -21,7 +22,12 @@ import click
 import yaml
 
 from nerve import paths
-from nerve.workspace import initialize_workspace, install_bundled_skills
+from nerve.config import _interpolate_str, workspace_settings_file
+from nerve.workspace import (
+    initialize_workspace,
+    install_bundled_skills,
+    install_config_scaffold,
+)
 
 
 # --- Cron definitions for the wizard ---
@@ -1623,13 +1629,18 @@ class SetupWizard:
 
         # 1. Create workspace from templates
         click.echo("  Creating workspace...", nl=False)
-        ws_path = Path(os.path.expanduser(str(self.choices.workspace_path)))
+        ws_path = self._workspace_dir()
         created = initialize_workspace(ws_path, self.choices.mode)
         click.secho(" ✓", fg="green")
 
         # 2. Install bundled skills
         click.echo("  Installing bundled skills...", nl=False)
         install_bundled_skills(ws_path)
+        click.secho(" ✓", fg="green")
+
+        # 2b. Scaffold the git-syncable config subtree (workspace/config/)
+        click.echo("  Creating config subtree...", nl=False)
+        install_config_scaffold(ws_path)
         click.secho(" ✓", fg="green")
 
         # 3. Patch USER.md with name/timezone if provided (personal mode)
@@ -1661,17 +1672,29 @@ class SetupWizard:
         # must never silently destroy hand edits (model tweaks, paired
         # Telegram users, ...).
         backed_up = []
-        for name in ("config.yaml", "config.local.yaml"):
-            existing = self.config_dir / name
-            if existing.exists():
-                shutil.copy2(existing, existing.with_suffix(existing.suffix + ".bak"))
-                backed_up.append(f"{name}.bak")
+        for existing in (
+            self.config_dir / "config.yaml",
+            self.config_dir / "config.local.yaml",
+            workspace_settings_file(self._workspace_dir()),
+        ):
+            if not existing.exists() or not _has_config_content(existing):
+                # install_config_scaffold has just created a comments-only
+                # settings.yaml, and it lives in a git-tracked directory —
+                # backing that up would leave a junk .bak in the repo on every
+                # fresh install, and claim to have rescued something.
+                continue
+            shutil.copy2(existing, existing.with_suffix(existing.suffix + ".bak"))
+            backed_up.append(f"{existing.name}.bak")
         if backed_up:
             click.echo(f"  Backed up existing config → {', '.join(backed_up)}")
 
-        # 7. Write config.yaml
+        # 7. Write config.yaml (machine-local) + settings.yaml (portable)
         click.echo("  Writing config.yaml...", nl=False)
         self._write_config_yaml()
+        click.secho(" ✓", fg="green")
+
+        click.echo("  Writing workspace config/settings.yaml...", nl=False)
+        self._write_workspace_settings()
         click.secho(" ✓", fg="green")
 
         # 8. Write config.local.yaml
@@ -1910,15 +1933,92 @@ class SetupWizard:
                 fg="yellow",
             )
 
-    def _write_config_yaml(self) -> None:
-        """Write the base config.yaml."""
-        ws = str(self.choices.workspace_path)
-        tz = self.choices.timezone
+    def _workspace_dir(self) -> Path:
+        """The workspace path, expanded the same way the config loader does.
 
-        config: dict[str, Any] = {
-            "workspace": ws,
-            "timezone": tz,
+        nerve/config.py resolves `workspace` with ${VAR} interpolation *and*
+        expandvars/expanduser. Expanding differently here would put
+        settings.yaml somewhere the loader never looks — the wizard would
+        report success and every portable setting would be silently lost.
+        """
+        return _expand_workspace(str(self.choices.workspace_path))
+
+    @staticmethod
+    def _leaf_paths(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+        """Flatten a nested dict to ``{"a.b": value}``. Lists are leaves."""
+        out: dict[str, Any] = {}
+        for key, value in d.items():
+            path = f"{prefix}{key}"
+            if isinstance(value, dict):
+                out.update(SetupWizard._leaf_paths(value, f"{path}."))
+            else:
+                out[path] = value
+        return out
+
+    @staticmethod
+    def _set_leaf(d: dict[str, Any], path: str, value: Any) -> None:
+        *parents, last = path.split(".")
+        node = d
+        for part in parents:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[last] = value
+
+    @staticmethod
+    def _del_leaf(d: dict[str, Any], path: str) -> bool:
+        """Remove ``path``, pruning any dict it leaves empty. True if removed."""
+        *parents, last = path.split(".")
+        chain: list[tuple[dict[str, Any], str]] = []
+        node = d
+        for part in parents:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                return False
+            chain.append((node, part))
+            node = child
+        if last not in node:
+            return False
+        del node[last]
+        for parent, key in reversed(chain):
+            if not parent[key]:
+                del parent[key]
+        return True
+
+    # Keys that describe *this box* and must never travel with the workspace
+    # repo. Everything else the wizard decides is shared behaviour and belongs
+    # in the tracked settings layer, so `nerve config sync` and lockdown mean
+    # something on a default install instead of being no-ops.
+    #
+    # A key must appear in exactly one of the two dicts below. config.yaml
+    # shadows settings.yaml, so writing a portable value to both would make
+    # the tracked copy dead weight -- edit it and nothing happens.
+
+    def _build_config_layers(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+        """Split the wizard's answers into (machine-local, portable, shadowed).
+
+        ``shadowed`` lists dotted portable paths this run deliberately routes
+        to the machine layer instead. They have to be *removed* from a
+        pre-existing settings.yaml, not merely omitted: switching an existing
+        install to Bedrock would otherwise leave the old non-prefixed model
+        names sitting in the tracked file, present in both layers and
+        permanently masked.
+        """
+        machine: dict[str, Any] = {
+            "workspace": str(self.choices.workspace_path),
             "deployment": self.choices.deployment,
+            "gateway": {
+                "host": "0.0.0.0",
+                "port": 8900,
+            },
+        }
+        shadowed: list[str] = []
+        portable: dict[str, Any] = {
+            "timezone": self.choices.timezone,
             "agent": {
                 "model": "claude-opus-4-8",
                 "cron_model": "claude-sonnet-4-6",
@@ -1927,10 +2027,6 @@ class SetupWizard:
                 "thinking": "max",
                 "effort": "max",
                 "context_1m": True,
-            },
-            "gateway": {
-                "host": "0.0.0.0",
-                "port": 8900,
             },
             "quiet_start": "02:00",
             "quiet_end": "08:00",
@@ -1956,59 +2052,158 @@ class SetupWizard:
         }
 
         if self.choices.mode == "personal":
-            config["telegram"] = {
-                "enabled": bool(self.choices.telegram_bot_token),
+            # dm_policy/stream_mode are shared behaviour; `enabled` is not --
+            # it is derived from whether *this* machine was given a bot token,
+            # and the token itself lives in config.local.yaml.
+            machine["telegram"] = {"enabled": bool(self.choices.telegram_bot_token)}
+            portable["telegram"] = {
                 "dm_policy": "pairing",
                 "stream_mode": "partial",
             }
-            config["sync"] = {
+            portable["sync"] = {
                 "telegram": {"enabled": self.choices.telegram_sync},
-                "gmail": {
-                    "enabled": self.choices.gmail_sync,
-                    "accounts": self.choices.gmail_accounts,
-                },
+                "gmail": {"enabled": self.choices.gmail_sync},
                 "github": {"enabled": self.choices.github_sync},
                 "github_events": {"enabled": self.choices.github_sync},
                 # Disabled by default — requires an explicit list of repos to watch.
                 "github_repos": {"enabled": False, "repos": []},
             }
+            # Which sources to sync is shared policy; *whose* mailboxes is
+            # not. These are personal addresses in a file the docs tell you to
+            # commit, and they are per-person rather than per-team.
+            machine.setdefault("sync", {})["gmail"] = {
+                "accounts": self.choices.gmail_accounts
+            }
 
-        # Provider configuration
+        # Provider configuration. Machine-local: an AWS profile is a local
+        # credential handle, and the Bedrock model IDs are geography-scoped to
+        # the region chosen here, so they cannot be shared either. They go in
+        # the machine layer *instead of* the portable one rather than as well,
+        # so nothing is written twice.
         if self.choices.provider_type == "bedrock":
-            config["provider"] = {
+            machine["provider"] = {
                 "type": "bedrock",
                 "aws_region": self.choices.aws_region,
             }
             if self.choices.aws_profile:
-                config["provider"]["aws_profile"] = self.choices.aws_profile
-            # Override model names to Bedrock inference-profile IDs.
+                machine["provider"]["aws_profile"] = self.choices.aws_profile
             # The prefix is geography-scoped (us./eu./apac.) and must match
             # the configured region or every call 400s.
             geo = bedrock_geo_prefix(self.choices.aws_region)
-            config["agent"]["model"] = f"{geo}.anthropic.claude-opus-4-8"
-            config["agent"]["cron_model"] = f"{geo}.anthropic.claude-sonnet-4-6"
-            config["agent"]["title_model"] = f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"
-            config["memory"]["recall_model"] = f"{geo}.anthropic.claude-sonnet-4-6"
-            config["memory"]["memorize_model"] = f"{geo}.anthropic.claude-sonnet-4-6"
-            config["memory"]["fast_model"] = f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"
+            for section, key, value in (
+                ("agent", "model", f"{geo}.anthropic.claude-opus-4-8"),
+                ("agent", "cron_model", f"{geo}.anthropic.claude-sonnet-4-6"),
+                ("agent", "title_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
+                ("memory", "recall_model", f"{geo}.anthropic.claude-sonnet-4-6"),
+                ("memory", "memorize_model", f"{geo}.anthropic.claude-sonnet-4-6"),
+                ("memory", "fast_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            ):
+                portable[section].pop(key, None)
+                shadowed.append(f"{section}.{key}")
+                machine.setdefault(section, {})[key] = value
 
         if self.choices.use_proxy:
-            config["proxy"] = {
-                "enabled": True,
-                "port": 8317,
-            }
+            # A local helper process on a local port.
+            machine["proxy"] = {"enabled": True, "port": 8317}
 
         if self.choices.deployment == "docker":
-            config["docker"] = {
+            machine["docker"] = {
                 "extra_mounts": [],  # e.g. ["~/code:/code", "~/projects:/projects"]
             }
 
+        return machine, portable, shadowed
+
+    def _write_config_yaml(self) -> None:
+        """Write the machine-local base config.yaml."""
+        machine, _portable, _shadowed = self._build_config_layers()
         config_path = self.config_dir / "config.yaml"
         with open(config_path, "w") as f:
-            f.write("# Nerve — Configuration\n")
-            f.write("# Edit this file to customize Nerve's behavior.\n")
-            f.write("# Secrets (API keys, tokens) go in config.local.yaml.\n\n")
-            yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+            f.write("# Nerve — Machine-local configuration\n")
+            f.write("# Settings specific to this box: workspace location,\n")
+            f.write("# bind address, deployment style, local credentials handles.\n")
+            f.write("# Shared behaviour lives in <workspace>/config/settings.yaml,\n")
+            f.write("# which this file overrides. Secrets go in config.local.yaml.\n\n")
+            yaml.safe_dump(machine, f, default_flow_style=False, sort_keys=False)
+
+    def _write_workspace_settings(self) -> None:
+        """Write the portable half into ``<workspace>/config/settings.yaml``.
+
+        Ownership model: the wizard owns the keys it generates and rewrites
+        them from this run's answers, exactly as it does for config.yaml.
+        Anything else in the file -- a team policy key, a hand-tuned setting
+        the wizard never emits -- is preserved untouched.
+
+        The alternative ("existing always wins") sounds safer for a file that
+        may be shared through git, but it means re-running init after changing
+        an answer silently does nothing: the wizard prompts for a timezone,
+        prints a tick, and discards the answer because the key already exists.
+        Overwriting is recoverable -- there is a .bak, and the file is in a
+        repo where the diff is visible before anyone commits it.
+        """
+        _machine, portable, shadowed = self._build_config_layers()
+        settings_path = workspace_settings_file(self._workspace_dir())
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        raw = ""
+        existing: dict[str, Any] = {}
+        if settings_path.exists():
+            raw = settings_path.read_text(encoding="utf-8")
+            try:
+                loaded = yaml.safe_load(raw)
+            except yaml.YAMLError as e:
+                click.secho(
+                    f"\n    Warning: {settings_path} is not valid YAML ({e}) —"
+                    " leaving it alone.",
+                    fg="yellow",
+                )
+                return
+            if loaded is not None and not isinstance(loaded, dict):
+                click.secho(
+                    f"\n    Warning: {settings_path} is not a mapping —"
+                    " leaving it alone.",
+                    fg="yellow",
+                )
+                return
+            existing = loaded or {}
+
+        merged = copy.deepcopy(existing)
+        added, changed, removed = [], [], []
+        for path, value in self._leaf_paths(portable).items():
+            before = self._leaf_paths(merged).get(path, _MISSING)
+            if before is _MISSING:
+                added.append(path)
+            elif before != value:
+                changed.append(f"{path}: {before!r} → {value!r}")
+            self._set_leaf(merged, path, value)
+        for path in shadowed:
+            if self._del_leaf(merged, path):
+                removed.append(path)
+
+        if merged == existing:
+            return
+
+        # safe_dump cannot round-trip comments, and this file is meant to be
+        # read by other people in a PR. Say so rather than quietly deleting
+        # someone's rationale.
+        if existing and any(
+            line.lstrip().startswith("#")
+            for line in raw.splitlines()[_SETTINGS_HEADER_LINES:]
+        ):
+            click.secho(
+                f"\n    Note: comments in {settings_path.name} are not preserved"
+                " when it is regenerated (the previous file is in"
+                f" {settings_path.name}.bak).",
+                fg="yellow",
+            )
+
+        with open(settings_path, "w") as f:
+            f.write(_SETTINGS_HEADER)
+            yaml.safe_dump(merged, f, default_flow_style=False, sort_keys=False)
+
+        for label, items in (("added", added), ("updated", changed),
+                             ("moved to config.yaml", removed)):
+            if items:
+                click.secho(f"\n    {label}: {', '.join(items)}", dim=True)
 
     def _write_config_local_yaml(self) -> None:
         """Write config.local.yaml with secrets."""
@@ -2249,7 +2444,7 @@ class SetupWizard:
             click.echo("    nerve doctor             Verify everything is set up")
         click.echo("    http://localhost:8900     Open the web UI")
         click.echo()
-        ws = os.path.expanduser(str(self.choices.workspace_path))
+        ws = str(self._workspace_dir())
         click.secho(f"  Your workspace: {ws}", bold=True)
         click.echo("    Edit SOUL.md to customize Nerve's personality")
         click.echo("    Edit USER.md to tell Nerve about yourself")
@@ -2422,6 +2617,40 @@ def _wrap_text(text: str, width: int = 51) -> list[str]:
     if current:
         lines.append(current)
     return lines or [""]
+
+
+def _has_config_content(path: Path) -> bool:
+    """True if the file holds at least one key (not just comments/blank)."""
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return True  # can't tell — err towards keeping a backup
+    return bool(data)
+
+
+def _expand_workspace(raw: str) -> Path:
+    """Expand a workspace path the way nerve.config resolves it."""
+    if "${" in raw:
+        raw = _interpolate_str(raw, [])
+    return Path(os.path.expandvars(os.path.expanduser(raw)))
+
+
+_MISSING = object()
+
+# Regenerated verbatim on every write; anything below it is user content, so
+# the comment-loss warning only fires for comments the operator added.
+_SETTINGS_HEADER = """\
+# Nerve — Shared configuration
+# Git-tracked and portable: this is the layer that syncs between machines and
+# the one lockdown mode trusts. Machine-specific values belong in config.yaml,
+# which overrides this file. Secrets belong in config.local.yaml or behind an
+# ${ENV_VAR} reference — never here.
+#
+# `nerve init` owns the keys it generates and rewrites them on re-run. Keys it
+# does not generate are left alone.
+
+"""
+_SETTINGS_HEADER_LINES = _SETTINGS_HEADER.count("\n")
 
 
 # --- Docker file templates ---

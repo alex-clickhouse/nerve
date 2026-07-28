@@ -1,10 +1,51 @@
 # Configuration Reference
 
-Nerve uses two YAML config files:
-- `config.yaml` — Template settings (version controlled)
-- `config.local.yaml` — Secrets and personal overrides (gitignored)
+Nerve assembles configuration from up to three layers, **lowest precedence
+first**:
 
-Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
+1. `workspace/config/settings.yaml` — shareable, git-tracked settings that live
+   inside the workspace (the portable surface you can sync from a remote repo).
+2. `config.yaml` — machine-local base settings.
+3. `config.local.yaml` — machine-local secrets and personal overrides (gitignored).
+
+Each layer is deep-merged on top of the previous, so a machine can override
+shared settings locally (until lockdown mode makes the workspace layer the only
+source of truth). The workspace location itself is resolved from `config.yaml`
+(or the default `~/nerve-workspace`) *before* `settings.yaml` is read, so a
+`workspace:` key inside `settings.yaml` is ignored (it would be circular).
+
+If `workspace/config/settings.yaml` is absent, behavior is exactly as before —
+just `config.yaml` + `config.local.yaml`.
+
+`nerve init` splits its answers across the first two layers rather than writing
+everything to `config.yaml`. Only things that describe *this box* stay
+machine-local:
+
+| Layer | Gets |
+|-------|------|
+| `config.yaml` | `workspace`, `deployment`, `gateway.host`/`port`, `provider` (incl. the region-scoped Bedrock model IDs), `proxy`, `docker`, `telegram.enabled`, `external_agents` |
+| `settings.yaml` | `timezone`, `agent.*`, `memory.*`, `sessions.*`, `sync.*`, `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
+
+A key is written to exactly one of them. Writing a shared value to both would
+make the tracked copy dead weight, since `config.yaml` shadows it.
+
+Re-running `nerve init` regenerates `config.yaml` and `config.local.yaml`
+wholesale. `settings.yaml` is git-tracked and may be shared, so it is handled
+by ownership instead: the wizard rewrites the keys in the table above from
+this run's answers and leaves every other key in the file untouched — a team
+policy setting the wizard never emits survives. It prints what it added,
+updated and removed. Each of the three files is copied to `*.bak` first if it
+holds any setting at all; an empty or comments-only file is skipped, since
+there is nothing in it to lose — that keeps a freshly scaffolded
+`settings.yaml` from leaving a junk `.bak` in a git-tracked directory on every
+install.
+
+Two caveats. `settings.yaml` is rewritten with `yaml.safe_dump`, which cannot
+round-trip comments, so a re-init that changes anything drops them (you are
+warned, and the previous file is in `settings.yaml.bak`). And because the
+wizard owns those keys, changing an answer *does* overwrite what someone else
+put there — review the diff before committing.
+
 Unknown keys are ignored but logged as warnings at startup (and shown by
 `nerve doctor`) so typos don't fail silently.
 
@@ -15,9 +56,11 @@ TLS is off, not TLS with an empty certificate path.
 
 ## Environment Variable References
 
-Any string value in `config.yaml` / `config.local.yaml` may reference an
-environment variable, so secrets can be supplied from the environment (or a
-secret store) instead of being written into a file:
+Any string value in **any of the three layers** — `settings.yaml`,
+`config.yaml`, `config.local.yaml` — may reference an environment variable, so
+secrets can be supplied from the environment (or a secret store) instead of
+being written into a file. Interpolation runs once, after all three are
+merged:
 
 ```yaml
 anthropic_api_key: ${ANTHROPIC_API_KEY}         # required — load fails if unset

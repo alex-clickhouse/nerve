@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone, tzinfo
+from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -35,6 +37,12 @@ logger = logging.getLogger(__name__)
 # tool clamps delays to >= 60s, so a 20s sweep keeps fire latency well under
 # the granularity the model can request.
 _WAKEUP_SWEEP_SECONDS = 20
+
+# How long the config watcher waits before re-checking, when there is nothing
+# it can watch yet or when starting the watch failed. Long enough not to spin,
+# short enough that a cron directory that appears later (a workspace clone, a
+# hand-created dir) starts being watched without a daemon restart.
+_WATCH_RETRY_SECONDS = 30
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
 # /loop command, so resolve them to a plain continuation instruction.
@@ -242,6 +250,14 @@ def _crontab_to_trigger(
         raise InvalidScheduleError(
             f"Invalid crontab expression {schedule!r}: {e}",
         ) from e
+
+
+async def _wait_or_stop(event: asyncio.Event, seconds: float) -> None:
+    """Wait up to ``seconds``, returning early once ``event`` is set."""
+    try:
+        await asyncio.wait_for(event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
 
 
 def _parse_timestamp(ts: str) -> datetime:
@@ -533,6 +549,191 @@ class CronService:
             "updated": updated,
             "enabled": enabled,
         }
+
+    def _watch_targets(self) -> list[Path]:
+        """The directories whose contents should trigger a cron reload."""
+        return sorted(
+            {
+                self.config.cron.jobs_file.parent,
+                self.config.cron.system_file.parent,
+                self.config.cron.gate_plugins_dir,
+            },
+            key=str,
+        )
+
+    def _watch_dirs(self) -> list[str]:
+        """Directories to hand to awatch for cron config changes.
+
+        awatch requires each path to exist. When a target dir doesn't exist yet
+        (fresh install / not-yet-cloned workspace), fall back one level to its
+        parent (e.g. ``workspace/config``, created by the init scaffold) —
+        awatch is recursive, so the target is still covered once it appears.
+        Falling back only one level keeps the watch scope tight; a target whose
+        parent is missing too is left out, and the caller waits for it.
+        """
+        dirs: set[str] = set()
+        for d in self._watch_targets():
+            if d.exists():
+                dirs.add(str(d))
+            elif d.parent.exists():
+                dirs.add(str(d.parent))
+        return sorted(dirs)
+
+    def _watch_filter(self, dirs: list[str]) -> Callable[..., bool]:
+        """The change filter to use for a watch over ``dirs``.
+
+        Three rules, in order:
+
+        * watchfiles' default ignores, which drop the bytecode file that
+          importing a gate plugin writes next to it;
+        * a *modified* directory, which is not the same thing. A directory's
+          own mtime bumps whenever a child is added or removed, and the
+          child's event is the one that carries the information — so the bump
+          is redundant when we can see the child, and misleading when we
+          can't. Writing ``__pycache__`` is exactly the latter: the ``.pyc``
+          is filtered but the bump on ``gates/`` survives, and honoring it
+          lets a reload re-trigger itself;
+        * scope. When a target dir is missing we watch its parent, which is
+          wider than what we care about — an unrelated sibling there would
+          reload cron on every edit. Targets are re-read per change rather
+          than captured, so repointing the config can't leave this admitting
+          the old location and rejecting the new one.
+        """
+        from watchfiles import Change, DefaultFilter
+
+        default = DefaultFilter()
+        watched = set(dirs)
+
+        def keep(change, path: str) -> bool:
+            if not default(change, path):
+                return False
+            if change is Change.modified and Path(path).is_dir():
+                return False
+            targets = self._watch_targets()
+            if watched <= {str(t) for t in targets}:
+                return True  # nothing in scope to narrow
+            return any(Path(path).is_relative_to(t) for t in targets)
+
+        return keep
+
+    async def watch_config(self, stop_event: "asyncio.Event | None" = None) -> None:
+        """Watch the cron config directories and hot-reload on change.
+
+        Each settled batch of filesystem changes triggers one :meth:`reload`, so
+        a workspace git pull (or a hand edit) applies without a restart. The
+        watcher is resilient: a reload that fails (e.g. a malformed file caught
+        mid-edit) is logged and the watcher keeps running so a later fix is
+        picked up. Runs until cancelled or ``stop_event`` is set.
+
+        The directories are re-derived continuously rather than bound once,
+        because the set moves under a running daemon: a cron dir may not exist
+        yet, in which case we watch its parent until it appears (and simply
+        wait if not even the parent exists) instead of giving up until the next
+        restart. Should ``cron.jobs_file`` / ``system_file`` /
+        ``gate_plugins_dir`` ever be repointed while the daemon runs, the same
+        machinery moves the watch with them rather than leaving :meth:`reload`
+        reading files nobody watches — today those only change across a
+        restart, which rebinds the watch anyway.
+
+        Comparing the freshly derived set against the one the running watch was
+        actually handed is what keeps that race-free: whoever changed the paths
+        needs no cooperation from here, and a change that lands mid-batch is
+        caught by the next comparison rather than lost.
+
+        Note: an editor that truncates-then-writes can momentarily present an
+        empty file; watchfiles' debounce coalesces the truncate+write into one
+        batch in the common case, and a legitimately-emptied jobs.yaml *should*
+        unschedule its jobs, so we don't special-case empty content here.
+        """
+        from watchfiles import awatch
+
+        # A caller that passes no event still needs one internally: it is how
+        # the watch and the retry wait are interrupted by the same signal.
+        stop = stop_event if stop_event is not None else asyncio.Event()
+        # Directories the running watch was handed; None until the first pass.
+        watching: list[str] | None = None
+        # Reload as soon as the next watch is live, without waiting for a
+        # change. Set whenever we may have missed one: a moved directory set
+        # holds files nobody has read, and anything edited before the watch
+        # started (or during an outage) raises no event. Deliberately not set
+        # for the first watch of the process — start() just read those files.
+        catch_up = False
+        # Most recent watcher / reload failure, so one that repeats every cycle
+        # is logged once instead of filling the log. Both are cleared as soon
+        # as the thing they describe works again, so a recurring transient is
+        # still reported each time it recurs.
+        last_failure: str | None = None
+        last_reload_error: str | None = None
+        while not stop.is_set():
+            dirs = self._watch_dirs()
+            if watching != dirs:
+                catch_up = catch_up or watching is not None
+                # A different location is a different story, even if it fails
+                # with the same words: don't let the dedupe swallow it.
+                last_failure = last_reload_error = None
+                if dirs:
+                    logger.info("Cron auto-reload: watching %s", ", ".join(dirs))
+                else:
+                    logger.info(
+                        "Cron auto-reload: nothing to watch yet (%s and its "
+                        "parent are missing) — re-checking every %ds",
+                        self.config.cron.jobs_file.parent, _WATCH_RETRY_SECONDS,
+                    )
+                watching = dirs
+            if not dirs:
+                await _wait_or_stop(stop, _WATCH_RETRY_SECONDS)
+                continue
+            try:
+                # yield_on_timeout surfaces watchfiles' own idle timeout as an
+                # empty batch, which is how a repointed config gets noticed
+                # while the directory being watched stays quiet. Note that the
+                # timeout restarts on every raw batch, so the re-check below
+                # is only as prompt as the next yield: a watched directory
+                # under constant filtered-out churn can defer it.
+                async for changes in awatch(
+                    *dirs,
+                    watch_filter=self._watch_filter(dirs),
+                    stop_event=stop,
+                    yield_on_timeout=True,
+                ):
+                    last_failure = None  # the watch is up; a later error is news
+                    if changes or catch_up:
+                        try:
+                            result = await self.reload()
+                            # Only now is the catch-up discharged. It is the
+                            # sole record that this directory holds files no
+                            # event will ever announce, so a failed attempt has
+                            # to keep it and try again on the next tick — a
+                            # config that never loads should stay loud.
+                            catch_up = False
+                            last_reload_error = None
+                            logger.info(
+                                "Cron auto-reload applied: +%d ~%d -%d",
+                                len(result["added"]), len(result["updated"]),
+                                len(result["removed"]),
+                            )
+                        except Exception as e:  # noqa: BLE001 — keep watching after a bad edit
+                            if str(e) != last_reload_error:
+                                logger.warning(
+                                    "Cron auto-reload skipped a bad change: %s", e,
+                                )
+                                last_reload_error = str(e)
+                    if self._watch_dirs() != dirs:
+                        break  # re-enter awatch on the new directories
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — a watcher failure must not crash
+                # e.g. inotify limits (ENOSPC) or a watched dir vanishing.
+                # Retry rather than degrade to "no auto-reload until restart",
+                # but don't repeat one persistent failure every cycle forever.
+                if str(e) != last_failure:
+                    logger.warning(
+                        "Cron auto-reload watcher failed, retrying every %ds: %s",
+                        _WATCH_RETRY_SECONDS, e,
+                    )
+                    last_failure = str(e)
+                catch_up = True
+                await _wait_or_stop(stop, _WATCH_RETRY_SECONDS)
 
     async def stop(self) -> None:
         """Stop the scheduler."""

@@ -48,8 +48,21 @@ jobs:
       - name: Install project and test dependencies
         run: uv pip install -e ".[test]"
 
+      # Split so a wall-clock failure is attributable from the step name and
+      # doesn't hide the rest of the run, and so an ordinary logic error
+      # surfaces without first sitting through the timing-based waits. Same
+      # venv, so this costs nothing over one combined run.
       - name: Run test suite
-        run: .venv/bin/pytest tests/ -v
+        run: .venv/bin/pytest tests/ -v -m "not slow"
+
+      # `slow` tests drive real filesystem watching and real elapsed time, so
+      # they are the likeliest to flake — but they are also the only coverage
+      # of behaviour the mocks cannot see, so they gate merges like any other
+      # test. Run even when the step above failed: one CI run should report
+      # everything that is broken, not just the first thing.
+      - name: Run slow tests
+        if: ${{ !cancelled() }}
+        run: .venv/bin/pytest tests/ -v -m slow
 
   frontend-build:
     name: Frontend build (Vite)

@@ -502,6 +502,7 @@ Manual commands (run regardless of `enabled`):
 | `cron.system_file` | path | `<workspace>/config/cron/system.yaml` (falls back to `~/.nerve/cron/system.yaml` for un-migrated installs) | System cron jobs (managed by `nerve init`) |
 | `cron.jobs_file` | path | `<workspace>/config/cron/jobs.yaml` (falls back to `~/.nerve/cron/jobs.yaml`) | User-defined custom cron jobs |
 | `cron.gate_plugins_dir` | path | `<workspace>/config/cron/gates` (falls back to `~/.nerve/cron/gates`) | Drop-in custom gate plugin directory |
+| `cron.auto_reload` | bool | `true` | Watch the cron directory and hot-reload jobs on change (no restart) |
 
 ## Workflow Runs
 

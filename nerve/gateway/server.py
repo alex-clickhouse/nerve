@@ -38,6 +38,7 @@ from nerve.observability.langfuse import (
     flush as langfuse_flush,
     init_langfuse,
 )
+from nerve.utils.aio import stop_background_task
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,8 @@ async def lifespan(app: FastAPI):
     # Start cron service
     global _cron_service
     cron_task = None
+    cron_watch_task = None
+    cron_watch_stop = None
     try:
         from nerve.cron.service import CronService
         cron = CronService(config, _engine, db)
@@ -236,6 +239,13 @@ async def lifespan(app: FastAPI):
         for job in cron._jobs:
             if not job.show_session_label:
                 notification_service.hide_session_label_for(f"cron:{job.id}")
+
+        # Hot-reload cron config on file change (e.g. after a workspace pull).
+        if config.cron.auto_reload:
+            cron_watch_stop = asyncio.Event()
+            cron_watch_task = asyncio.create_task(
+                cron.watch_config(stop_event=cron_watch_stop)
+            )
     except Exception as e:
         logger.warning("Cron service failed to start: %s", e)
 
@@ -563,9 +573,11 @@ async def lifespan(app: FastAPI):
             logger.warning("Codex thread sync shutdown raised: %s", e)
         _codex_thread_sync = None
 
-    # Stop the external-agents sync service. Cheap — it just cancels
-    # the periodic loop; no per-file cleanup needed because every write
-    # is already atomic (temp + rename).
+    # Stop the external-agents sync service. Like the cron watcher below, it
+    # exits through its own stop event so a sweep in flight finishes the whole
+    # target set rather than stopping partway down it; cancellation is the
+    # backstop. Individual writes need no cleanup — each is atomic
+    # (temp + rename).
     if _external_agents_sync is not None:
         try:
             await _external_agents_sync.stop()
@@ -579,6 +591,12 @@ async def lifespan(app: FastAPI):
     # the telegram polling task before we get a chance to stop it cleanly.
     if telegram_channel:
         await telegram_channel.stop()
+    if cron_watch_task:
+        # Let the watcher finish the cycle it's in — a reload cancelled halfway
+        # leaves the scheduler holding a mix of the old and new job sets — and
+        # exit through its own stop path, which is what shuts the watchfiles
+        # thread down. Cancellation is the backstop, not the mechanism.
+        await stop_background_task(cron_watch_task, cron_watch_stop, "Cron watcher")
     if cron_task:
         await cron_task.stop()
     if _workflow_run_service is not None:

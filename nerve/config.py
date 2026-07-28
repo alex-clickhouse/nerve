@@ -881,6 +881,9 @@ class CronConfig:
     # Directory scanned at startup for drop-in custom gate plugins (.py files
     # defining CronGate subclasses). See nerve/cron/gate_plugins.py.
     gate_plugins_dir: Path = field(default_factory=lambda: paths.cron_dir() / "gates")
+    # Watch the cron config directory and hot-reload on change (e.g. after a
+    # workspace git pull) without a restart. See CronService.watch_config.
+    auto_reload: bool = True
 
     @classmethod
     @_coerced
@@ -890,6 +893,7 @@ class CronConfig:
             jobs_file=_expand_path(d.get("jobs_file")) or base / "jobs.yaml",
             system_file=_expand_path(d.get("system_file")) or base / "system.yaml",
             gate_plugins_dir=_expand_path(d.get("gate_plugins_dir")) or base / "gates",
+            auto_reload=d.get("auto_reload", True),
         )
 
 

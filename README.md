@@ -289,3 +289,8 @@ See [docs/config.md](docs/config.md) for all options.
 ```bash
 pytest tests/ -v
 ```
+
+A handful of tests are marked `slow` — they drive real filesystem watching and
+real elapsed time. CI runs them in a step of their own so a timing failure is
+easy to spot; for a fast local loop, `pytest tests/ -m "not slow"` skips them
+and `pytest tests/ -m slow` runs just those.

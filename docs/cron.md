@@ -29,8 +29,11 @@ Running `nerve init` on an existing install regenerates `system.yaml` (e.g., to 
 ### Hot-reload (no restart)
 
 Changes to `jobs.yaml` / `system.yaml` — adding, removing, rescheduling,
-enabling/disabling a job — can be applied to the running daemon **without a
-restart** via `POST /api/cron/reload`. The reload diffs the new job set against
+enabling/disabling a job — are applied to the running daemon **without a
+restart**. By default a file watcher on the cron directory reloads automatically
+on any change (e.g. after a workspace `git pull`); you can also trigger it
+explicitly via `POST /api/cron/reload`. Disable the watcher with
+`cron.auto_reload: false`. The reload diffs the new job set against
 the running scheduler and adds / removes / re-schedules only what changed
 (source runners and internal cleanup/wakeup jobs are left alone). Prompt-file
 *contents* were already hot (read fresh each run); reload covers the job
@@ -40,6 +43,12 @@ YAML didn't change: those keep their existing timer and just have their gate
 objects swapped, so editing a gate never resets a schedule.
 
 Notes:
+- The watcher **waits for the directory**. If the cron directory doesn't exist
+  yet, it isn't given up on: the watcher watches the parent directory meanwhile
+  (ignoring anything outside the cron paths), re-checks every 30s if not even
+  the parent is there, and narrows onto the cron directory as soon as it
+  appears — then reloads, since files already sitting there when the watch
+  starts raise no change event. No restart needed.
 - A **malformed** `jobs.yaml`/`system.yaml` (bad YAML or an invalid job) is
   **refused** — reload returns `400` and the running schedule is left untouched,
   so a typo can't wipe your crons.

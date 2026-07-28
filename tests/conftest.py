@@ -50,6 +50,14 @@ def _repoint_import_time_state_paths(monkeypatch: pytest.MonkeyPatch) -> None:
                 monkeypatch.setattr(module, attr, target)
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slow: drives real filesystem watching or other wall-clock I/O; "
+        "deselect with -m 'not slow'",
+    )
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Use a single event loop for all tests."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -359,6 +360,38 @@ class TestCronJobGates:
         })
         assert len(job.gates) == 1
         assert isinstance(job.gates[0], TasksGate)
+
+    def test_from_dict_normalizes_only_a_bare_key(self):
+        """A bare `run_if:` is None and means "no gates". Nothing else does:
+        a wrong shape has to survive on the job so `nerve config validate` can
+        reject it, instead of turning into an ungated job that looks correct."""
+        bare = CronJob.from_dict({"id": "x", "schedule": "1h", "prompt": "p",
+                                  "run_if": None, "skip_when_idle": None})
+        assert bare.run_if == [] and bare.skip_when_idle == []
+
+        for shape in ({}, "", 0, "tasks", {"type": "tasks"}):
+            job = CronJob.from_dict({
+                "id": "x", "schedule": "1h", "prompt": "p", "run_if": shape,
+            })
+            assert job.run_if == shape, f"{shape!r} was normalized away"
+            job = CronJob.from_dict({
+                "id": "x", "schedule": "1h", "prompt": "p",
+                "skip_when_idle": shape,
+            })
+            assert job.skip_when_idle == shape, f"{shape!r} was normalized away"
+
+    def test_a_wrong_shape_is_logged_and_dropped_not_raised(self, caplog):
+        """__post_init__ builds the gates, so raising would drop the whole job
+        over a gate typo — quieter than a job that runs. Fail open and say so."""
+        with caplog.at_level(logging.ERROR, logger="nerve.cron.jobs"):
+            job = CronJob.from_dict({
+                "id": "x", "schedule": "1h", "prompt": "p", "run_if": 0,
+                "skip_when_idle": {},
+            })
+
+        assert job.gates == []
+        assert "run_if" in caplog.text and "runs unconditionally" in caplog.text
+        assert "skip_when_idle" in caplog.text
 
 
 # ---------------------------------------------------------------------------

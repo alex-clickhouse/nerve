@@ -104,6 +104,104 @@ Notes:
 - Defaults are **not** re-scanned: `${A:-${B}}` yields the literal `${B}` when
   `A` is unset; nest by using a single reference instead.
 
+## Validating Configuration
+
+`nerve config validate` checks the whole config bundle and exits non-zero on any
+error, so it drops straight into CI on the config/workspace repo:
+
+```bash
+nerve config validate                 # validate the active install's config
+nerve config validate --workspace .   # validate a checked-out config repo
+nerve config validate --strict-keys   # also fail on unknown/misspelled keys
+nerve config validate --strict-env    # also require every ${ENV_VAR} to be set
+```
+
+It fails on an unparseable or invalid cron file, a malformed `run_if` gate spec,
+a bad spec for a built-in gate, and backend/codex misconfiguration. It runs even
+when the config can't otherwise load (that's the point), so a missing required
+secret won't stop it.
+
+It also fails on a **schedule the daemon would not run as written** — both in
+`cron/jobs.yaml` / `cron/system.yaml` and in `sync.<source>.schedule` — reporting
+every offender in the bundle, by job id:
+
+* a 5-field crontab the scheduler rejects, like `99 * * * *`. At run time the
+  daemon refuses to schedule that job and logs it, but only after the change has
+  merged and synced, leaving the instance on its old config.
+* a schedule that is neither a crontab nor an interval, like `hourly`, `@daily`
+  or `every day`. Nothing complains about this one at run time *ever*: it falls
+  back to a fixed 2-hour default and the job runs, just not on the cadence
+  anybody wrote down. Validation is the only place it can be caught.
+
+Write a 5-field crontab (`*/15 * * * *`) or an interval (`4h`, `30m`, `1h30m`,
+`90s`); those are the only two forms the scheduler understands.
+
+It also fails on a **blank path setting**. `workspace`, `cron.jobs_file`,
+`cron.system_file` and `cron.gate_plugins_dir` all read as "unset, use the
+default" when left empty, but `Path("")` is `Path(".")` — they actually point at
+whatever directory the daemon was started in. For `cron.gate_plugins_dir` that
+is a code-execution footgun: every `.py` file in that directory is imported and
+executed at startup and on every cron reload. Omit the key to get the default;
+never set it to `''`, `.` or `./`.
+
+**What it will not check: your gate plugins.** Validation never loads the
+`.py` files in `<workspace>/config/cron/gates/` — importing one to check it
+would mean the bundle had already run by the time validation decided it was
+unfit, which is the one thing a gate on untrusted config cannot do. So a
+`run_if` entry naming a gate type that isn't built in is reported as a
+**warning**: a plugin may well provide it, but validation can neither confirm
+the type exists nor check the spec's fields, because both answers live inside
+code it declines to run. A plugin is code; test it the way you test code.
+
+Two checks are deliberately lenient by default, so that validating a live
+install doesn't cry wolf:
+
+| Flag | Default | With the flag |
+|------|---------|---------------|
+| `--strict-keys` | An unknown or misspelled key is a **warning** — a config carrying a key from a newer nerve, or the shipped example, still passes. Covers config keys and the fields inside a built-in gate's `run_if` spec. | Unknown keys are errors. |
+| `--strict-env` | An unset `${ENV_VAR}` is **info** — CI has no secrets to hand. | Every reference must resolve. |
+
+**Turn `--strict-keys` on in CI.** A typo'd key is the most common config
+mistake and the quietest: nothing loads it, and without the flag the check
+exits 0. Pin the nerve version the workflow installs to the one you deploy, so a
+key introduced by a newer nerve can't fail the check against an older validator.
+
+One more flag controls *what* gets validated. `--portable-only` ignores this
+machine's `config.yaml` and `config.local.yaml` and judges the portable
+`<workspace>/config/settings.yaml` layer on its own. Use it when reviewing a
+change headed for a shared repo: otherwise a local override can mask an invalid
+shared value, and — more often — a broken *local* file fails a shared bundle
+that has nothing wrong with it. Pass `--workspace` alongside it: with no machine
+config left to read the workspace location from, it falls back to the default
+one, and validating the wrong tree is how a CI gate ends up green and useless.
+`--portable-only` fails outright if it opened no file at all under the
+workspace's `config/` — an empty directory, a `settings.yml` typo or a
+`settings.yaml` left at the repo root all mean the gate reviewed nothing. Every
+run also names the layers it read, in absolute paths, so you can always see
+which tree that was:
+
+```
+[info] portable layer: /home/you/config-repo/config/settings.yaml
+[info] machine-local layers (config.yaml, config.local.yaml) not read: validating the portable workspace config on its own
+```
+
+Without `--portable-only` the second line instead names the machine-local files
+that were overlaid, and the directory they came from.
+
+Example GitHub Actions step for a config repo:
+
+```yaml
+jobs:
+  validate-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      # Pin to the nerve version you deploy, so the validator agrees with it.
+      - run: uv pip install --system nerve   # or: pip install <your nerve dist>
+      - run: nerve config validate --workspace . --portable-only --strict-keys
+```
+
 ## Config Directory Resolution
 
 `nerve` commands locate the config directory via a waterfall, so they work

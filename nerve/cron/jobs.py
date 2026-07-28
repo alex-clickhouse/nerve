@@ -42,6 +42,15 @@ def describe_reserved_job_ids() -> str:
     )
 
 
+def _none_to_empty(value: Any) -> Any:
+    """``None`` becomes ``[]``; every other value is returned verbatim.
+
+    A bare ``run_if:`` / ``skip_when_idle:`` key parses to None and means "no
+    gates". Nothing else does — see :meth:`CronJob.from_dict`.
+    """
+    return [] if value is None else value
+
+
 @dataclass
 class CronJob:
     """A cron job definition."""
@@ -164,13 +173,38 @@ class CronJob:
         return self.prompt
 
     def _build_gates(self) -> list["CronGate"]:
-        """Construct gate objects from run_if plus the legacy shorthand."""
+        """Construct gate objects from run_if plus the legacy shorthand.
+
+        Both fields hold whatever the config said (from_dict normalizes only a
+        bare key), so either may be the wrong shape here. A wrong shape is
+        logged and ignored rather than raised: this runs from __post_init__, so
+        raising would drop the whole job — and a job that vanishes over a gate
+        typo is harder to notice than a job that runs. It is also what
+        build_gates already does with a spec it cannot build. The log line is
+        then the only thing between a mistyped gate block and a job that fires
+        every time, so it says which field and what the consequence is.
+        """
         from nerve.cron.gates import build_gates
 
-        specs: list[dict] = list(self.run_if)
+        specs: list[dict] = []
+        if isinstance(self.run_if, list):
+            specs.extend(self.run_if)
+        else:
+            logger.error(
+                "Cron job %s: 'run_if' must be a list of gate specs, got %r — "
+                "ignoring it, so the job runs unconditionally",
+                self.id, self.run_if,
+            )
         # Translate the legacy skip_when_idle shorthand into a messages gate
         # so old configs keep working without rewrites.
-        if self.skip_when_idle:
+        if not isinstance(self.skip_when_idle, list):
+            logger.error(
+                "Cron job %s: 'skip_when_idle' must be a list of source names, "
+                "got %r — ignoring it, so the job does not check for new "
+                "messages before running",
+                self.id, self.skip_when_idle,
+            )
+        elif self.skip_when_idle:
             specs.append({
                 "type": "messages",
                 "sources": list(self.skip_when_idle),
@@ -197,8 +231,20 @@ class CronJob:
             catchup=d.get("catchup", True),
             enabled=d.get("enabled", True),
             lock=bool(d.get("lock", False)),
-            run_if=d.get("run_if", []),
-            skip_when_idle=d.get("skip_when_idle", []),
+            # `run_if:` with nothing under it parses to None, which would blow
+            # up gate construction and take the whole job with it. An empty key
+            # means "no gates", the same as omitting it.
+            #
+            # Only None. Every other wrong shape is kept exactly as written, even
+            # the falsy ones (`run_if: {}` from a half-finished edit or a merge),
+            # because emptying it here destroys the only evidence there was ever
+            # a gate: the job runs unconditionally and `nerve config validate`
+            # reports the file clean, since by then it is indistinguishable from
+            # a job that never asked to be gated. Same reasoning as
+            # TelegramConfig.allowed_users — leave the value alone so it can be
+            # rejected, rather than coercing it into something plausible.
+            run_if=_none_to_empty(d.get("run_if")),
+            skip_when_idle=_none_to_empty(d.get("skip_when_idle")),
             idle_consumer=d.get("idle_consumer", "inbox"),
             show_session_label=d.get("show_session_label", True),
             metadata=d.get("metadata", {}),

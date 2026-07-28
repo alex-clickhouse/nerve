@@ -111,3 +111,18 @@ propose_config_change(
 - Never put secrets in tracked files; reference them as `${ENV_VAR}`.
 - If validation fails, fix the reported errors and re-submit — don't try to
   bypass it by editing files directly.
+
+## First-time setup (if there's no config repo yet)
+
+If the workspace isn't yet a git repo synced from a remote, `propose_config_change`
+has nothing to open a PR against. Setting up the config repo is an **operator**
+task, not something you do autonomously — walk the human through it:
+
+1. Run `nerve config init-repo` — scaffolds the CI workflow, `.gitignore`, a
+   README and a `config/settings.yaml` into the workspace, and prints the
+   remaining git/`gh` steps.
+2. Create the private GitHub repo and push (`git init` → commit → `gh repo create`).
+3. Enable `workspace_sync` (and, when ready, `lockdown`) in `settings.yaml`.
+
+Full runbook: `docs/config.md` → "Setting up the config repo". Once the remote
+exists and sync is on, use `propose_config_change` for all further changes.

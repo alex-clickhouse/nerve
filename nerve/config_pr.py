@@ -616,6 +616,14 @@ def propose_config_change(
             )
 
         # Validate the proposed bundle — never open a PR for a broken config.
+        #
+        # Deliberately the lenient question, not the one the config repo's own CI
+        # asks: that workflow adds --strict-keys and --portable-only, so a typo'd
+        # key it would reject only gets a warning here and the PR still opens. The
+        # asymmetry is on purpose — the reviewer sees the red check and the
+        # explanation with the change in front of them, which is a better place to
+        # settle "is this key real" than a refusal here with no diff to look at.
+        # Erring the other way would block proposals on keys a newer nerve knows.
         from nerve.config_validate import validate_config_bundle
         errors = validate_config_bundle(config_dir, workspace_override=wt).errors
         if errors:

@@ -1,0 +1,78 @@
+name: validate-config
+
+# Validates the Nerve config bundle on every PR so a broken change can't be
+# merged and then synced onto a live instance. See docs/config.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Backstop for the one thing review is worst at spotting: a credential
+      # pasted into a tracked file. Secrets belong in the environment and are
+      # referenced from settings.yaml as ${ENV_VAR}. Runs before anything else
+      # is fetched, so it scans this repo and nothing else, and needs no token
+      # of its own — the image is used directly because the marketplace action
+      # asks organizations for a license key.
+      #
+      # Pinned for the same reason the validator below is: an argument renamed
+      # in a later gitleaks would otherwise fail every config repo at once, with
+      # no pull request anywhere to explain it. (From 8.19 this subcommand is
+      # spelled `gitleaks dir <path>`; bump the tag and the args together.)
+      # A false positive on a high-entropy string is silenced with a trailing
+      # `# gitleaks:allow`, or repo-wide in a .gitleaks.toml.
+      - name: Scan for committed secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.18.4
+        with:
+          args: detect --no-git --source=/github/workspace --redact
+
+      # The validator needs only the standard library + PyYAML, so we run it
+      # straight from a source checkout — no `pip install nerve`, and none of
+      # nerve's runtime dependencies. ClickHouse/nerve is public, so no token
+      # is needed.
+      #
+      # __NERVE_REF_NOTE__
+      - name: Check out the nerve validator
+        uses: actions/checkout@v5
+        with:
+          repository: ClickHouse/nerve
+          ref: __NERVE_REF__
+          path: .nerve-src
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pyyaml
+
+      # The config repo root IS the workspace (it holds config/ and skills/).
+      #
+      # --portable-only judges the tracked bundle on its own — no machine-local
+      # config.yaml, and no falling back to a machine-local cron directory when
+      # this repo carries no jobs — and fails outright if it opened no file under
+      # config/ at all, so a layout mistake can't pass as clean.
+      # --strict-keys makes a misspelled key block the PR rather than warn.
+      #
+      # PYTHONSAFEPATH keeps this checkout off sys.path. `python -m` otherwise
+      # puts the working directory first, so a `yaml.py` or a `nerve/` directory
+      # committed to the config repo would be imported instead of the real one —
+      # running code out of a pull request before anyone has read it.
+      #
+      # Unset ${ENV_VAR} secret refs are reported as info (CI has no secrets);
+      # add --strict-env to require them. If any instance served by this repo is
+      # locked through ${NERVE_LOCKDOWN}, add --assume-lockdown as well, or CI
+      # only ever checks the unlocked view that instance never loads.
+      - name: Validate config bundle
+        env:
+          PYTHONPATH: .nerve-src
+          PYTHONSAFEPATH: '1'
+        run: python -m nerve.config_validate --workspace . --portable-only --strict-keys

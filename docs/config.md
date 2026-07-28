@@ -168,15 +168,21 @@ install doesn't cry wolf:
 
 **Turn `--strict-keys` on in CI.** A typo'd key is the most common config
 mistake and the quietest: nothing loads it, and without the flag the check
-exits 0. Pin the nerve version the workflow installs to the one you deploy, so a
-key introduced by a newer nerve can't fail the check against an older validator.
+exits 0. Pin the nerve the workflow validates with to the one you deploy, so a
+key introduced by a newer nerve can't fail the check against an older validator
+— `nerve config init-repo` writes that pin in for you.
 
 One more flag controls *what* gets validated. `--portable-only` ignores this
 machine's `config.yaml` and `config.local.yaml` and judges the portable
 `<workspace>/config/settings.yaml` layer on its own. Use it when reviewing a
 change headed for a shared repo: otherwise a local override can mask an invalid
 shared value, and — more often — a broken *local* file fails a shared bundle
-that has nothing wrong with it. Pass `--workspace` alongside it: with no machine
+that has nothing wrong with it. Cron is covered too: normally a workspace
+carrying no jobs falls back to the machine-local `~/.nerve/cron`, which is right
+for an un-migrated install and wrong here — a typo in *that* file would fail a
+shared bundle that doesn't contain it — so under `--portable-only` only the
+repo's own `config/cron/` counts, and anything skipped is named in the report.
+Pass `--workspace` alongside it: with no machine
 config left to read the workspace location from, it falls back to the default
 one, and validating the wrong tree is how a CI gate ends up green and useless.
 `--portable-only` fails outright if it opened no file at all under the
@@ -201,14 +207,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
-      # Pin to the nerve version you deploy, so the validator agrees with it.
-      - run: uv pip install --system nerve   # or: pip install <your nerve dist>
-      - run: nerve config validate --workspace . --portable-only --strict-keys
+      # The validator needs the standard library and PyYAML, nothing else, so
+      # it runs from a source checkout pinned to the ref you deploy. Nerve is
+      # not published to PyPI — `pip install nerve` would fetch an unrelated
+      # package — and installing the app to lint a config file would pull in
+      # every runtime dependency for no benefit.
+      - uses: actions/checkout@v5
+        with:
+          repository: ClickHouse/nerve
+          ref: <the nerve revision your instance runs>
+          path: .nerve-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      # PYTHONSAFEPATH keeps the config repo off sys.path: `python -m` would
+      # otherwise put the working directory first, so a `yaml.py` or a `nerve/`
+      # directory committed to this repo would be imported instead of the real
+      # one — running code straight out of an unreviewed pull request.
+      #
       # Add --assume-lockdown if any instance served by this repo is locked and
       # the flag comes from the environment — otherwise CI checks the unlocked
       # view and the lockdown checks never run. See "Lockdown" below.
+      - env:
+          PYTHONPATH: .nerve-src
+          PYTHONSAFEPATH: '1'
+        run: python -m nerve.config_validate --workspace . --portable-only --strict-keys
 ```
+
+`nerve config init-repo` scaffolds this workflow on every PR, plus a
+[gitleaks](https://github.com/gitleaks/gitleaks) scan ahead of it for the one
+thing review is worst at catching — a credential pasted into a tracked file. See
+[Setting up the config repo](#setting-up-the-config-repo) for the generated file
+and the end-to-end setup.
 
 ## Hot-Reload
 
@@ -296,6 +327,171 @@ the same skills failure gives `ok: false` on `/api/config/reload` and
 `ok: true, applied: false` on `/api/config/sync`. **On the sync endpoint, read
 `applied`, not `ok`**, unless what you want to know is specifically whether the
 merge took.
+
+## Setting up the config repo
+
+The workspace *is* the config repo: its root holds `config/` (settings, cron) and
+`skills/`. To put it under review and sync it to an instance, turn the workspace
+into a git repo with a GitHub remote, add CI validation, and (optionally) enable
+lockdown.
+
+**1. Scaffold the repo files.** From the instance (or anywhere with the workspace
+checked out):
+
+```bash
+nerve config init-repo                       # scaffolds into the resolved workspace
+nerve config init-repo --workspace ./ws      # or an explicit path; --dry-run to preview
+```
+
+This writes four files into the workspace (never overwriting existing ones):
+
+- `.github/workflows/validate-config.yml` — the CI check (below)
+- `.gitignore` — keeps `config.local.yaml`, `.env`, `*.migrated`, DBs, etc. out of
+  the shared repo (secrets must never be committed — they're `${ENV_VAR}` refs)
+- `README.md` — a short explainer of the PR-based flow
+- `config/settings.yaml` — the commented portable settings scaffold, if the
+  workspace doesn't already have one. An instance's workspace does; a bare
+  directory doesn't, and the CI check below fails a repo with no `config/` at
+  all rather than passing it, so the scaffold seeds one.
+
+**2. Create the GitHub repo and push.** The command prints these — it can't run
+them for you (they need a repo name and auth):
+
+```bash
+cd <workspace>
+git init && git add -A && git commit -m "Initial Nerve config"
+gh repo create <org>/nerve-config --private --source=. --remote=origin --push
+```
+
+**3. CI validation.** The scaffolded workflow validates the bundle and scans for
+committed secrets on every PR. It needs no secrets or tokens of its own —
+`ClickHouse/nerve` is public — and it doesn't install nerve at all: the validator
+depends only on the standard library and PyYAML, so CI checks out the source and
+runs it in place:
+
+```yaml
+name: validate-config
+
+# Validates the Nerve config bundle on every PR so a broken change can't be
+# merged and then synced onto a live instance. See docs/config.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Backstop for the one thing review is worst at spotting: a credential
+      # pasted into a tracked file. Secrets belong in the environment and are
+      # referenced from settings.yaml as ${ENV_VAR}. Runs before anything else
+      # is fetched, so it scans this repo and nothing else, and needs no token
+      # of its own — the image is used directly because the marketplace action
+      # asks organizations for a license key.
+      #
+      # Pinned for the same reason the validator below is: an argument renamed
+      # in a later gitleaks would otherwise fail every config repo at once, with
+      # no pull request anywhere to explain it. (From 8.19 this subcommand is
+      # spelled `gitleaks dir <path>`; bump the tag and the args together.)
+      # A false positive on a high-entropy string is silenced with a trailing
+      # `# gitleaks:allow`, or repo-wide in a .gitleaks.toml.
+      - name: Scan for committed secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.18.4
+        with:
+          args: detect --no-git --source=/github/workspace --redact
+
+      # The validator needs only the standard library + PyYAML, so we run it
+      # straight from a source checkout — no `pip install nerve`, and none of
+      # nerve's runtime dependencies. ClickHouse/nerve is public, so no token
+      # is needed.
+      #
+      # `ref` is pinned to the nerve revision this instance runs, which is what
+      # makes --strict-keys below safe: an older validator rejects keys the
+      # instance understands, and a newer one accepts keys it doesn't. Bump it
+      # when you upgrade the instance — `nerve config init-repo` will not, it
+      # never overwrites this file.
+      - name: Check out the nerve validator
+        uses: actions/checkout@v5
+        with:
+          repository: ClickHouse/nerve
+          ref: <the nerve revision your instance runs>
+          path: .nerve-src
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pyyaml
+
+      # The config repo root IS the workspace (it holds config/ and skills/).
+      #
+      # --portable-only judges the tracked bundle on its own — no machine-local
+      # config.yaml, and no falling back to a machine-local cron directory when
+      # this repo carries no jobs — and fails outright if it opened no file under
+      # config/ at all, so a layout mistake can't pass as clean.
+      # --strict-keys makes a misspelled key block the PR rather than warn.
+      #
+      # PYTHONSAFEPATH keeps this checkout off sys.path. `python -m` otherwise
+      # puts the working directory first, so a `yaml.py` or a `nerve/` directory
+      # committed to the config repo would be imported instead of the real one —
+      # running code out of a pull request before anyone has read it.
+      #
+      # Unset ${ENV_VAR} secret refs are reported as info (CI has no secrets);
+      # add --strict-env to require them. If any instance served by this repo is
+      # locked through ${NERVE_LOCKDOWN}, add --assume-lockdown as well, or CI
+      # only ever checks the unlocked view that instance never loads.
+      - name: Validate config bundle
+        env:
+          PYTHONPATH: .nerve-src
+          PYTHONSAFEPATH: '1'
+        run: python -m nerve.config_validate --workspace . --portable-only --strict-keys
+```
+
+That is the file verbatim, comments included — they explain each flag where the
+person editing it will be looking. `python -m nerve.config_validate` is the same
+code as `nerve config validate` (the CLI is just a colorized wrapper) and the two
+take the same flags, so running the command above locally gives the same verdict
+CI will. Note the *config* repo is private; only nerve itself is public.
+
+**The `ref:` is the part that needs your attention.** `init-repo` pins it to the
+commit of the nerve source the instance runs, and says so in the comment it
+writes. It can only do that when nerve was installed from a git checkout, that
+checkout is clean, and its commit is on a remote CI can fetch — a commit no
+remote has would fail `actions/checkout` on *every* PR, which is worse than not
+pinning. When any of those doesn't hold it writes `main`, and the comment above
+the step says it is **not** pinned and why. Either way `init-repo` never
+overwrites an existing workflow, so **bump the pin by hand when you upgrade the
+instance**; the command will not do it for you on a re-run.
+
+Gate plugins need nothing installed here: validation never loads them (see
+[Validating Configuration](#validating-configuration)), so their imports are
+never resolved in CI.
+
+**4. Point the instance at the remote and enable sync.** The workspace is already
+a git clone of the repo, so the remote and credentials come from git itself. Turn
+on periodic pulls in `workspace/config/settings.yaml`:
+
+```yaml
+workspace_sync:
+  enabled: true
+  branch: main
+  interval_minutes: 5
+```
+
+**5. (Optional) Lock it down.** Once secrets are in the environment as `${ENV_VAR}`
+refs, set `lockdown: true` in `settings.yaml` so the instance only ever runs the
+reviewed, merged remote. See [Lockdown](#lockdown-remote-only-read-only).
+
+From here the loop is: open a PR → CI validates → review + merge → the instance
+syncs and hot-reloads. The agent proposes its own changes the same way via the
+`nerve-workspace` skill.
 
 ## Git-Backed Workspace Sync
 
